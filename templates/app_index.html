@@ -1,0 +1,168 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <link rel="stylesheet" href="{{ config.static.url }}css/xterm.css" />
+
+    <link
+      rel="stylesheet"
+      href="https://fonts.googleapis.com/css?family=Roboto%20Mono"
+    />
+    <script>
+      // Capture WebSocket for Timex keyboard shortcuts
+      (function() {
+        var OrigWS = window.WebSocket;
+        window.__timexWS = null;
+        window.WebSocket = function(url, protocols) {
+          var ws = protocols !== undefined
+            ? new OrigWS(url, protocols)
+            : new OrigWS(url);
+          window.__timexWS = ws;
+          return ws;
+        };
+        window.WebSocket.prototype = OrigWS.prototype;
+        window.WebSocket.CONNECTING = OrigWS.CONNECTING;
+        window.WebSocket.OPEN = OrigWS.OPEN;
+        window.WebSocket.CLOSING = OrigWS.CLOSING;
+        window.WebSocket.CLOSED = OrigWS.CLOSED;
+      })();
+    </script>
+    <script src="{{ config.static.url }}js/textual.js"></script>
+    <style>
+      body {
+        background: #171717;
+        overflow: hidden;
+      }
+
+      #terminal {
+        margin-top: 12px;
+      }
+
+      ::-webkit-scrollbar {
+        display: none;
+      }
+
+      .dialog-container {
+        position: absolute;
+        width: 100vw;
+        height: 100vh;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        z-index: 10;
+      }
+      .shade {
+        position: absolute;
+        width: 100%;
+        height: 100%;
+        background: #171717;
+      }
+      .intro {
+        display: none;
+      }
+
+      body.-first-byte .intro-dialog,
+      body.-first-byte .intro-dialog .shade {
+        opacity: 0;
+        transition: opacity 0.3s ease-out;
+        display: none;
+      }
+
+      body .textual-terminal {
+        opacity: 0;
+        transition: opacity 0.3s ease-out;
+      }
+
+      body.-first-byte .textual-terminal {
+        opacity: 1;
+        transition: opacity 0.3s ease-out;
+      }
+
+      .closed-dialog {
+        opacity: 0;
+        display: none;
+      }
+
+      body.-closed .closed-dialog {
+        opacity: 0;
+        display: none;
+      }
+
+      body.-closed .closed-dialog .intro {
+        display: flex;
+        width: 640px;
+        height: 240px;
+        font-size: 16px;
+        z-index: 20;
+        font-family: "Roboto Mono", menlo, monospace;
+        text-align: center;
+        color: rgba(255, 255, 255, 0.95);
+        background-color: #1e1e1e;
+        align-items: center;
+        justify-content: center;
+        margin: 32px;
+      }
+
+      #start {
+        display: none;
+      }
+
+      #start.-delay {
+        display: flex;
+      }
+
+      Button {
+        padding: 16px 32px;
+        background-color: #e8a55d;
+        color: #171717;
+        border: none;
+        font-family: "Roboto Mono", menlo, monospace;
+        margin: 16px;
+        display: block;
+        cursor: pointer;
+      }
+
+      Button:hover {
+        background: #f0b978;
+      }
+    </style>
+    <script>
+      function getStartUrl() {
+        const url = new URL(window.location.href);
+        const params = new URLSearchParams(url.search);
+        params.delete("delay");
+        return url.pathname + "?" + params.toString();
+      }
+      async function refresh() {
+        const ping_url = document.body.dataset.pingurl;
+        if (ping_url) {
+          await fetch(ping_url, {
+            method: "GET",
+            mode: "no-cors",
+          });
+        }
+        window.location.href = getStartUrl();
+      }
+    </script>
+  </head>
+  <body data-pingurl="{{ ping_url }}">
+    <div class="dialog-container intro-dialog">
+      <div class="shade"></div>
+      <div class="intro"></div>
+    </div>
+
+    <div class="dialog-container closed-dialog">
+      <div class="shade"></div>
+      <div class="intro">
+        <div class="message">Session ended.</div>
+        <button type="button" onClick="refresh()">Restart</button>
+      </div>
+    </div>
+
+    <div
+      id="terminal"
+      class="textual-terminal"
+      data-session-websocket-url="{{ app_websocket_url }}"
+      data-font-size="{{ font_size }}"
+    ></div>
+  </body>
+</html>
