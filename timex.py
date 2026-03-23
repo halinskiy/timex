@@ -457,6 +457,8 @@ class TimexApp(App):
         self._final_active: float = 0.0
         self._project_history_secs: float = 0.0  # cached total from history
         self._project_history_loaded: bool = False
+        self._all_projects_history_secs: float = 0.0
+        self._all_projects_loaded: bool = False
         self._last_session_tasks: list[TaskEntry] = []
         self._accent: str = DEFAULT_ACCENT
         self._accent_hex: str = DEFAULT_ACCENT_HEX
@@ -756,9 +758,17 @@ class TimexApp(App):
         else:
             content = Align.center(status_text, vertical="middle")
 
+        # Total across all projects for title
+        all_total = self._all_projects_total_seconds()
+        all_h = all_total / 3600
+        if all_h >= 1:
+            all_str = f"{all_h:.1f}h"
+        else:
+            all_str = f"{int(all_total / 60)}m"
+
         panel = Panel(
             content,
-            title=f"[bold {self._accent}] \u23f1  Timex [/]",
+            title=f"[bold {self._accent}] \u23f1  Timex [/] [{DIM}]{all_str}[/]",
             title_align="center",
             border_style=DIMMER,
             padding=(1, 2),
@@ -2490,6 +2500,33 @@ class TimexApp(App):
         # Detect if /watch was used (any task has watched=True)
         self._sync_watch_used = any(getattr(t, "watched", False) for t in self._sync_tasks)
 
+        # Compute date range for multi-day sessions
+        first_date = self._sync_tasks[0].wall_start.date()
+        last_task = self._sync_tasks[-1]
+        last_end = last_task.wall_end if last_task.wall_end else self._now()
+        last_date = last_end.date()
+
+        def _fmt_single_date(d):
+            dt = datetime.combine(d, datetime.min.time())
+            return dt.strftime("%A, %B ") + str(d.day) + dt.strftime(", %Y")
+
+        if first_date != last_date:
+            s = datetime.combine(first_date, datetime.min.time())
+            e = datetime.combine(last_date, datetime.min.time())
+            self._sync_date_long = (s.strftime("%A, %B ") + str(first_date.day) +
+                                    " \u2013 " + e.strftime("%A, %B ") + str(last_date.day) +
+                                    e.strftime(", %Y"))
+            self._sync_date_search = [_fmt_single_date(first_date), _fmt_single_date(last_date)]
+            self._sync_link_dates = []
+            d = first_date
+            while d <= last_date:
+                self._sync_link_dates.append(d)
+                d += timedelta(days=1)
+        else:
+            self._sync_date_long = _fmt_single_date(first_date)
+            self._sync_date_search = []
+            self._sync_link_dates = [first_date]
+
         # Compute total duration for display
         active = self._active_seconds()
         self._sync_total_secs = 0.0
@@ -2530,7 +2567,7 @@ class TimexApp(App):
     def _render_export(self) -> None:
         """Render export view with date, task count, total, and options."""
         dt = self._sync_dt
-        date_long = dt.strftime("%A, %B ") + str(dt.day) + dt.strftime(", %Y")
+        date_long = getattr(self, "_sync_date_long", dt.strftime("%A, %B ") + str(dt.day) + dt.strftime(", %Y"))
         month_name = dt.strftime("%b")
         sheet_name = f"[{month_name} days report]"
         n = len(self._sync_tasks)
@@ -2660,7 +2697,8 @@ class TimexApp(App):
 
                 sheet_id = days_sheet.id
 
-                date_long = sync_dt.strftime("%A, %B ") + str(sync_dt.day) + sync_dt.strftime(", %Y")
+                date_long = self._sync_date_long
+                date_search = self._sync_date_search
                 all_vals = days_sheet.get_all_values()
 
                 # Calculate new table size: title + date + gap/warning + header + tasks + total
@@ -2670,7 +2708,7 @@ class TimexApp(App):
                 # Find and clear existing table (inserts/deletes rows if size differs)
                 start_row = self._find_and_clear_table(days_sheet, spreadsheet, sheet_id, date_long, all_vals,
                                                        creds=creds, spreadsheet_id=ssid,
-                                                       new_rows=new_rows)
+                                                       new_rows=new_rows, alt_date_longs=date_search)
 
                 rows = []
                 rows.append(["\u23f1 Time Report", "", "", "", ""])
@@ -2865,48 +2903,64 @@ class TimexApp(App):
 
                 # ── Update Link in monthly summary tab ──
                 try:
-                    month_tab = sync_dt.strftime("%b")  # e.g. "Mar"
-                    summary_sheet = spreadsheet.worksheet(month_tab)
-                    summary_id = summary_sheet.id
-                    summary_vals = summary_sheet.get_all_values()
-                    date_key = sync_dt.strftime("%d.%m.%Y")
-                    link_row = None
-                    for ri, row in enumerate(summary_vals):
-                        if row and row[0] == date_key:
-                            link_row = ri
-                            break
-                    if link_row is not None:
-                        link_uri = f"#gid={sheet_id}&range=A{start_row}"
-                        spreadsheet.batch_update({"requests": [{
-                            "updateCells": {
-                                "range": {
-                                    "sheetId": summary_id,
-                                    "startRowIndex": link_row,
-                                    "endRowIndex": link_row + 1,
-                                    "startColumnIndex": 4,
-                                    "endColumnIndex": 5,
-                                },
-                                "rows": [{"values": [{
-                                    "userEnteredValue": {"stringValue": "Link"},
-                                    "userEnteredFormat": {
-                                        "horizontalAlignment": "CENTER",
-                                        "verticalAlignment": "MIDDLE",
-                                        "textFormat": {
-                                            "fontSize": 12,
-                                            "link": {"uri": link_uri},
-                                        },
-                                        "hyperlinkDisplayType": "LINKED",
-                                    },
-                                }]}],
-                                "fields": "userEnteredValue,userEnteredFormat(horizontalAlignment,verticalAlignment,textFormat,hyperlinkDisplayType)",
-                            },
-                        }]})
+                    link_uri = f"#gid={sheet_id}&range=A{start_row}"
+                    link_dates = self._sync_link_dates
+
+                    # Group dates by month for cross-month support
+                    from collections import defaultdict
+                    dates_by_month = defaultdict(list)
+                    for d in link_dates:
+                        dates_by_month[datetime.combine(d, datetime.min.time()).strftime("%b")].append(
+                            d.strftime("%d.%m.%Y"))
+
+                    for mtab, date_keys in dates_by_month.items():
+                        try:
+                            summary_sheet = spreadsheet.worksheet(mtab)
+                            summary_id = summary_sheet.id
+                            summary_vals = summary_sheet.get_all_values()
+                            link_requests = []
+                            for date_key in date_keys:
+                                for ri, row in enumerate(summary_vals):
+                                    if row and row[0] == date_key:
+                                        link_requests.append({
+                                            "updateCells": {
+                                                "range": {
+                                                    "sheetId": summary_id,
+                                                    "startRowIndex": ri,
+                                                    "endRowIndex": ri + 1,
+                                                    "startColumnIndex": 4,
+                                                    "endColumnIndex": 5,
+                                                },
+                                                "rows": [{"values": [{
+                                                    "userEnteredValue": {"stringValue": "Link"},
+                                                    "userEnteredFormat": {
+                                                        "horizontalAlignment": "CENTER",
+                                                        "verticalAlignment": "MIDDLE",
+                                                        "textFormat": {
+                                                            "fontSize": 12,
+                                                            "link": {"uri": link_uri},
+                                                        },
+                                                        "hyperlinkDisplayType": "LINKED",
+                                                    },
+                                                }]}],
+                                                "fields": "userEnteredValue,userEnteredFormat(horizontalAlignment,verticalAlignment,textFormat,hyperlinkDisplayType)",
+                                            },
+                                        })
+                                        break
+                            if link_requests:
+                                spreadsheet.batch_update({"requests": link_requests})
+                        except Exception:
+                            pass  # Summary tab may not exist for this month
                 except Exception:
                     pass  # Link creation is cosmetic; don't fail sync
 
                 n = len(task_entries)
                 total_fmt = self._fmt_time(total_secs)
-                date_short = sync_dt.strftime("%d.%m")
+                if len(self._sync_link_dates) > 1:
+                    date_short = (self._sync_link_dates[0].strftime("%d.%m") + "\u2013" +
+                                  self._sync_link_dates[-1].strftime("%d.%m"))
+                else:
+                    date_short = sync_dt.strftime("%d.%m")
                 self.call_from_thread(self._leave_view, f"Synced {date_short} \u2014 {n} tasks, {total_fmt}")
 
             def _sync_thread():
@@ -2934,13 +2988,17 @@ class TimexApp(App):
                 days_sheet = spreadsheet.worksheet(f"[{month_name} days report]")
                 sheet_id = days_sheet.id
 
-                date_long = sync_dt.strftime("%A, %B ") + str(sync_dt.day) + sync_dt.strftime(", %Y")
+                date_long = self._sync_date_long
+                date_search = self._sync_date_search
                 all_vals = days_sheet.get_all_values()
 
                 # Find existing table
+                search_terms = {date_long}
+                if date_search:
+                    search_terms.update(date_search)
                 existing_row = None
                 for i, row in enumerate(all_vals):
-                    if row and row[0] == date_long:
+                    if row and row[0] in search_terms:
                         existing_row = i + 1
                         break
 
@@ -3027,7 +3085,7 @@ class TimexApp(App):
             ws.merge_cells("A1:E1")
             ws.cell(row=1, column=1, value="\u23f1 Time Report").font = Font(bold=True, size=14)
 
-            date_str = self._sync_dt.strftime("%A, %B %d, %Y")
+            date_str = self._sync_date_long
             ws.merge_cells("A2:E2")
             ws.cell(row=2, column=1, value=date_str).font = Font(color="888888", size=10)
 
@@ -3109,11 +3167,14 @@ class TimexApp(App):
 
     @staticmethod
     def _find_and_clear_table(days_sheet, spreadsheet, sheet_id, date_long, all_vals,
-                              creds=None, spreadsheet_id=None, new_rows=0):
+                              creds=None, spreadsheet_id=None, new_rows=0, alt_date_longs=None):
         """Find existing table by date, clear it, insert/delete rows if needed, return start_row."""
+        search_terms = {date_long}
+        if alt_date_longs:
+            search_terms.update(alt_date_longs)
         existing_row = None
         for i, row in enumerate(all_vals):
-            if row and row[0] == date_long:
+            if row and row[0] in search_terms:
                 existing_row = i + 1
                 break
 
@@ -3190,8 +3251,12 @@ class TimexApp(App):
             from datetime import datetime as _dt
 
             def _parse_date(s):
-                """Parse date string like 'Friday, March 7, 2026'."""
+                """Parse date string like 'Friday, March 7, 2026' or range 'Friday, March 22 – ..., 2026'."""
                 try:
+                    if " \u2013 " in s:
+                        parts = s.split(" \u2013 ")
+                        year = parts[1].strip().rsplit(", ", 1)[-1]
+                        return _dt.strptime(parts[0].strip() + ", " + year, "%A, %B %d, %Y")
                     return _dt.strptime(s.strip(), "%A, %B %d, %Y")
                 except ValueError:
                     return None
@@ -3237,6 +3302,8 @@ class TimexApp(App):
             self._toast("Nothing to save")
             return
         self._save_history()
+        self._project_history_loaded = False
+        self._all_projects_loaded = False
         self.state = IDLE
         self.tasks = []
         self._last_session_tasks = []
@@ -3881,6 +3948,7 @@ class TimexApp(App):
         self.total_paused = timedelta()
         self._final_active = 0.0
         self._project_history_loaded = False
+        self._all_projects_loaded = False
         self._last_session_tasks = []
         self._last_saved_at = ""
 
@@ -4509,6 +4577,29 @@ class TimexApp(App):
         if not self._project_history_loaded:
             self._reload_project_history_secs()
         return self._project_history_secs + self._active_seconds()
+
+    def _reload_all_projects_secs(self) -> None:
+        """Cache total active seconds from all projects' history."""
+        total = 0.0
+        if PROJECTS_DIR.exists():
+            for d in PROJECTS_DIR.iterdir():
+                if d.is_dir():
+                    hf = d / "history.json"
+                    if hf.exists():
+                        try:
+                            data = json.loads(hf.read_text())
+                            for session in data:
+                                total += session.get("total_active", 0.0)
+                        except (OSError, json.JSONDecodeError):
+                            pass
+        self._all_projects_history_secs = total
+        self._all_projects_loaded = True
+
+    def _all_projects_total_seconds(self) -> float:
+        """Total active seconds across all projects: all history + current session."""
+        if not self._all_projects_loaded:
+            self._reload_all_projects_secs()
+        return self._all_projects_history_secs + self._active_seconds()
 
     def _load_state(self) -> None:
         try:
