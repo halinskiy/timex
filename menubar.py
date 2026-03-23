@@ -147,6 +147,23 @@ def _active_seconds(data: dict) -> float:
     return max(0.0, elapsed.total_seconds())
 
 
+def _all_sessions_active() -> float:
+    """Sum of active (session) seconds across all projects."""
+    total = 0.0
+    if PROJECTS_DIR.exists():
+        for d in PROJECTS_DIR.iterdir():
+            if d.is_dir():
+                sf = d / "state.json"
+                if not sf.exists():
+                    continue
+                try:
+                    data = json.loads(sf.read_text())
+                    total += _active_seconds(data)
+                except (OSError, json.JSONDecodeError):
+                    pass
+    return total
+
+
 # ── Menu Bar App ─────────────────────────────────────────────────────────────
 
 
@@ -191,7 +208,7 @@ class TimexMenuBar(rumps.App):
             return
 
         state = data.get("state", IDLE)
-        active = _active_seconds(data)
+        active = _all_sessions_active()
         time_str = _fmt_time(active)
 
         # Alternate between timer and project name

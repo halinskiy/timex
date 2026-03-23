@@ -407,6 +407,7 @@ class TimexApp(App):
     def _enter_view(self, mode: str, placeholder: str) -> None:
         """Switch to a sub-view (help, timezone, notification, color, dates, edit)."""
         self._view_mode = mode
+        self._render_timer()
         self._render_history()
         self.query_one("#task-input", HistoryInput).placeholder = placeholder
 
@@ -457,8 +458,6 @@ class TimexApp(App):
         self._final_active: float = 0.0
         self._project_history_secs: float = 0.0  # cached total from history
         self._project_history_loaded: bool = False
-        self._all_projects_history_secs: float = 0.0
-        self._all_projects_loaded: bool = False
         self._last_session_tasks: list[TaskEntry] = []
         self._accent: str = DEFAULT_ACCENT
         self._accent_hex: str = DEFAULT_ACCENT_HEX
@@ -714,7 +713,13 @@ class TimexApp(App):
         self._render_footer()
 
     def _render_timer(self) -> None:
-        active = self._active_seconds()
+        in_project_view = self._view_mode == "project"
+
+        if in_project_view:
+            # In /project view: show total across all projects
+            active = self._all_sessions_active_seconds()
+        else:
+            active = self._active_seconds()
         time_str = self._fmt_time(active)
 
         if self.state == RUNNING:
@@ -729,7 +734,7 @@ class TimexApp(App):
 
         status_text = Text.from_markup(f"{indicator}    {time_markup}")
 
-        if self._project:
+        if self._project and not in_project_view:
             from rich.table import Table
             # Project total hours
             total_secs = self._project_total_seconds()
@@ -758,17 +763,9 @@ class TimexApp(App):
         else:
             content = Align.center(status_text, vertical="middle")
 
-        # Total across all projects for title
-        all_total = self._all_projects_total_seconds()
-        all_h = all_total / 3600
-        if all_h >= 1:
-            all_str = f"{all_h:.1f}h"
-        else:
-            all_str = f"{int(all_total / 60)}m"
-
         panel = Panel(
             content,
-            title=f"[bold {self._accent}] \u23f1  Timex [/] [{DIM}]{all_str}[/]",
+            title=f"[bold {self._accent}] \u23f1  Timex [/]",
             title_align="center",
             border_style=DIMMER,
             padding=(1, 2),
@@ -3303,7 +3300,6 @@ class TimexApp(App):
             return
         self._save_history()
         self._project_history_loaded = False
-        self._all_projects_loaded = False
         self.state = IDLE
         self.tasks = []
         self._last_session_tasks = []
@@ -3948,7 +3944,6 @@ class TimexApp(App):
         self.total_paused = timedelta()
         self._final_active = 0.0
         self._project_history_loaded = False
-        self._all_projects_loaded = False
         self._last_session_tasks = []
         self._last_saved_at = ""
 
@@ -4578,28 +4573,39 @@ class TimexApp(App):
             self._reload_project_history_secs()
         return self._project_history_secs + self._active_seconds()
 
-    def _reload_all_projects_secs(self) -> None:
-        """Cache total active seconds from all projects' history."""
+    def _all_sessions_active_seconds(self) -> float:
+        """Sum of active (session) seconds across all projects right now."""
         total = 0.0
         if PROJECTS_DIR.exists():
             for d in PROJECTS_DIR.iterdir():
                 if d.is_dir():
-                    hf = d / "history.json"
-                    if hf.exists():
-                        try:
-                            data = json.loads(hf.read_text())
-                            for session in data:
-                                total += session.get("total_active", 0.0)
-                        except (OSError, json.JSONDecodeError):
-                            pass
-        self._all_projects_history_secs = total
-        self._all_projects_loaded = True
-
-    def _all_projects_total_seconds(self) -> float:
-        """Total active seconds across all projects: all history + current session."""
-        if not self._all_projects_loaded:
-            self._reload_all_projects_secs()
-        return self._all_projects_history_secs + self._active_seconds()
+                    if d.name == self._project:
+                        total += self._active_seconds()
+                        continue
+                    sf = d / "state.json"
+                    if not sf.exists():
+                        continue
+                    try:
+                        data = json.loads(sf.read_text())
+                        st = data.get("state", IDLE)
+                        if st == IDLE:
+                            continue
+                        ss_str = data.get("session_start")
+                        if not ss_str:
+                            continue
+                        ss = datetime.fromisoformat(ss_str)
+                        tp = timedelta(seconds=data.get("total_paused_secs", 0.0))
+                        if st == RUNNING:
+                            elapsed = (self._now() - ss) - tp
+                        elif st == PAUSED:
+                            pa_str = data.get("paused_at")
+                            elapsed = (datetime.fromisoformat(pa_str) - ss) - tp if pa_str else (self._now() - ss) - tp
+                        else:
+                            continue
+                        total += max(0.0, elapsed.total_seconds())
+                    except (OSError, json.JSONDecodeError, ValueError):
+                        pass
+        return total
 
     def _load_state(self) -> None:
         try:
@@ -4636,33 +4642,8 @@ class TimexApp(App):
                 self.state = PAUSED
                 self._reset_reminder()
 
-                # Restore watch mode if it was active
-                wm = data.get("watch_mode")
-                if wm in ("screenshot", "focus"):
-                    self._watch_mode = wm
-                    self._watch_window_id = data.get("watch_window_id")
-                    self._watch_window_name = data.get("watch_window_name")
-                    self._watch_pid = data.get("watch_pid")
-                    # Re-init timing (like _start_watch but without creating a new task)
-                    now = _time.monotonic()
-                    self._watch_last_check = now
-                    self._watch_last_active = now
-                    self._watch_thinking = False
-                    self._watch_prev_task = None
-                    self._watch_last_pixels = None
-                    self._watch_activity = []
-                    self._watch_focus_stats = {}
-                    self._watch_last_ai_check = now - 170.0
-                    self._watch_last_ai_task = ""
-                    self._watch_ai_pending = False
-                    self._watch_bg_running = False
-                    self._watch_bg_result = None
-                    self._watch_lost = data.get("watch_lost", False)
-                    self._watch_used = data.get("watch_used", False)
-                    self._watch_ss_change_count = 0
-                    self._activity_log = []
-                    self._activity_last_poll = 0.0
-                    self._activity_prev_counters = {}
+                # Never restore watch mode on app restart — user must enable manually
+                self._watch_used = data.get("watch_used", False)
 
                 self._save_state()  # also sets self._last_saved_at
             elif saved_state == IDLE:
