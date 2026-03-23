@@ -497,6 +497,7 @@ class TimexApp(App):
         self._watch_last_ai_check: float = 0.0     # monotonic time of last AI analysis
         self._watch_last_ai_task: str = ""          # last task name from AI
         self._watch_ai_pending: bool = False        # True while AI request in flight
+        self._watch_generation: int = 0              # incremented on stop; AI checks stale results
         self._watch_app_changed_at: float = 0.0    # monotonic time of last app switch
         # Activity measurement (intensity-based)
         self._activity_log: list[dict] = []  # [{ts, kbd, mouse, click, scroll}] every 10s
@@ -1557,6 +1558,7 @@ class TimexApp(App):
             self._watch_thinking = False
             self._render_all()
             self._save_state()
+        self._watch_generation += 1
         self._watch_mode = None
         self._watch_window_id = None
         self._watch_window_name = None
@@ -1996,6 +1998,7 @@ class TimexApp(App):
 
     def _trigger_ai_analysis(self, cg_image, app_name: str) -> None:
         """OCR screenshot and send text to GPT-4o-mini."""
+        gen = self._watch_generation  # capture before async work
         try:
             cfg = json.loads(CONFIG_FILE.read_text())
         except (OSError, json.JSONDecodeError):
@@ -2003,7 +2006,8 @@ class TimexApp(App):
         api_key = cfg.get("openai_api_key", "")
         if not api_key:
             self._ai_log("no api key — falling back to app name")
-            self.call_from_thread(self._apply_ai_task, app_name)
+            if gen == self._watch_generation:
+                self.call_from_thread(self._apply_ai_task, app_name)
             return
 
         # OCR the screenshot
@@ -2121,11 +2125,19 @@ class TimexApp(App):
                 headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
             )
             try:
+                # Stale check: watch was stopped/restarted since this request began
+                if gen != self._watch_generation:
+                    self._ai_log("stale AI result — watch generation changed, discarding")
+                    return
                 with urllib.request.urlopen(req, timeout=15, context=ssl_ctx) as resp:
                     result = json.loads(resp.read())
                     label = result["choices"][0]["message"]["content"].strip().strip('"').strip("'")
                     _bump_ai_usage()
                     self._ai_log(f"ok: '{label}' (app={app_name}, current='{current_task}')")
+                    # Stale check again after API call
+                    if gen != self._watch_generation:
+                        self._ai_log("stale AI result — watch stopped, discarding")
+                        return
                     # Normalize Cyrillic lookalikes (С→S, А→A, Е→E, etc.)
                     _CYR_TO_LAT = str.maketrans("СсАаЕеОоРрКкМмТтНнХхВв", "SsAaEeOoPpKkMmTtNnXxBb")
                     label_norm = label.translate(_CYR_TO_LAT).upper()
@@ -2138,7 +2150,8 @@ class TimexApp(App):
                         self._ai_log(f"label rejected: empty={not label}, len={len(label)}")
             except Exception as e:
                 self._ai_log(f"api error: {e} — falling back to app name")
-                self.call_from_thread(self._apply_ai_task, app_name)
+                if gen == self._watch_generation:
+                    self.call_from_thread(self._apply_ai_task, app_name)
             finally:
                 self._watch_ai_pending = False
 
