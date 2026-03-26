@@ -1,8 +1,9 @@
 {
-  "version": "1.0.2",
+  "version": "1.0.3",
   "dmg_required": false,
   "changes": [
-    "Auto-update — check for new versions on startup",
-    "/update command — download and apply updates in-app"
+    "Update view with changelog and progress bar",
+    "SSL fix for py2app bundle",
+    "Show up-to-date state in /update view"
   ]
 }
