@@ -300,6 +300,10 @@ class HistoryInput(Input):
         if event.key == "up":
             event.prevent_default()
             event.stop()
+            if not self.value and app and getattr(app, "_update_notified", False) and getattr(app, "_view_mode", "") == "timeline":
+                self.value = "/update"
+                self.cursor_position = len(self.value)
+                return True
             if self._history:
                 if self._history_index == -1:
                     self._draft = self.value
@@ -495,6 +499,7 @@ class TimexApp(App):
         self._project: str | None = None  # active project name
         self._update_info: dict | None = None  # cached changelog from GitHub
         self._update_progress: float = -1  # -1=idle, 0..1=downloading, 2=done
+        self._update_notified: bool = False  # enables gradient border + placeholder
         self._sleep_at: float = 0.0  # monotonic time when /sleep should fire
 
         # ── Watch (window activity monitor) ──
@@ -720,6 +725,8 @@ class TimexApp(App):
                 if now - self._last_autosave >= AUTOSAVE_INTERVAL:
                     self._last_autosave = now
                     self._save_state()
+            elif self._update_notified:
+                self._render_footer()
         except Exception:
             CRASH_LOG.parent.mkdir(parents=True, exist_ok=True)
             CRASH_LOG.write_text(traceback.format_exc())
@@ -857,15 +864,24 @@ class TimexApp(App):
         scroll.border_title = "Timeline"
         display_tasks = self.tasks if self.tasks else self._last_session_tasks
         if not display_tasks:
-            if self.state == RUNNING:
-                hint = "Type what you\u2019re working on"
+            if self._update_notified and self.state == IDLE:
+                ver = self._update_info.get("version", "?") if self._update_info else "?"
+                rows = [
+                    Text(""),
+                    Text.from_markup(f"  [bold {self._accent}]v{ver} available[/]"),
+                    Text(""),
+                    Text.from_markup(f"  [{DIM}]Press[/] [bold {TEXT_COLOR}]\u2191[/] [{DIM}]and[/] [bold {TEXT_COLOR}]Enter[/] [{DIM}]to update[/]"),
+                ]
+                self.query_one("#history", Static).update(Group(*rows))
+            elif self.state == RUNNING:
+                self.query_one("#history", Static).update(
+                    Text.from_markup(f"\n  [white]Type what you\u2019re working on[/]\n"))
             elif self.state == PAUSED:
-                hint = "Timer paused \u2014 /resume to continue"
+                self.query_one("#history", Static).update(
+                    Text.from_markup(f"\n  [white]Timer paused \u2014 /resume to continue[/]\n"))
             else:
-                hint = "Type a task name to start"
-            self.query_one("#history", Static).update(
-                Text.from_markup(f"\n  [white]{hint}[/]\n")
-            )
+                self.query_one("#history", Static).update(
+                    Text.from_markup(f"\n  [white]Type a task name to start[/]\n"))
             return
         self._render_tasks(display_tasks, is_live=True)
 
@@ -964,7 +980,37 @@ class TimexApp(App):
 
         self.query_one("#history", Static).update(Group(*rows))
 
+    # Smooth gradient keyframes for update border
+    _GRADIENT_KEYS = [
+        (0xe8, 0xa5, 0x5d),  # Amber
+        (0xf5, 0xa6, 0x23),  # Orange
+        (0xe5, 0xc0, 0x7b),  # Gold
+        (0xe0, 0x6c, 0x75),  # Rose
+        (0xc6, 0x78, 0xdd),  # Purple
+        (0x61, 0xaf, 0xef),  # Blue
+        (0x56, 0xb6, 0xc2),  # Cyan
+        (0x98, 0xc3, 0x79),  # Green
+        (0xe8, 0xa5, 0x5d),  # back to Amber
+    ]
+    _GRADIENT_PERIOD = 24.0
+
+    def _update_gradient_color(self) -> str:
+        t = (_time.monotonic() % self._GRADIENT_PERIOD) / self._GRADIENT_PERIOD
+        n = len(self._GRADIENT_KEYS) - 1
+        pos = t * n
+        i = min(int(pos), n - 1)
+        frac = pos - i
+        r1, g1, b1 = self._GRADIENT_KEYS[i]
+        r2, g2, b2 = self._GRADIENT_KEYS[i + 1]
+        r = int(r1 + (r2 - r1) * frac)
+        g = int(g1 + (g2 - g1) * frac)
+        b = int(b1 + (b2 - b1) * frac)
+        return f"#{r:02x}{g:02x}{b:02x}"
+
     def _render_footer(self) -> None:
+        inp = self.query_one("#task-input", HistoryInput)
+        if self._update_notified and self._view_mode == "timeline":
+            inp.styles.border = ("tall", self._update_gradient_color())
         today = self._now().strftime("%a, %b %d %Y")
         parts = [f"[{DIM}]{today}[/]"]
         if self._watch_mode is not None:
@@ -4439,7 +4485,7 @@ class TimexApp(App):
         elif self._view_mode == "project_edit":
             self._project_editing = None
             self._enter_view("project", "  Enter number or type new project name • /back to return")
-        elif self._view_mode in ("dates", "help", "timezone", "notification", "edit", "color", "stats", "project", "watch", "confirm_reset", "export"):
+        elif self._view_mode in ("dates", "help", "timezone", "notification", "edit", "color", "stats", "project", "watch", "confirm_reset", "export", "update"):
             self._editing_task = None
             self._leave_view()
         else:
@@ -4492,7 +4538,9 @@ class TimexApp(App):
 
     def _update_placeholder(self) -> None:
         inp = self.query_one("#task-input", HistoryInput)
-        if self.state == RUNNING:
+        if self._update_notified and self._view_mode == "timeline":
+            inp.placeholder = "  Update available \u2014 type /update"
+        elif self.state == RUNNING:
             inp.placeholder = "  What are you working on?"
         elif self.state == PAUSED:
             inp.placeholder = "  Timer paused \u2014 /resume to continue"
@@ -4737,16 +4785,23 @@ class TimexApp(App):
 
     # ── Auto-update ────────────────────────────────────────────────────────
 
+    def _send_update_notification(self, version: str) -> None:
+        """Send macOS notification about available update."""
+        self._system_notify(f"Update {version} available \u2014 type /update")
+
     def _check_update_bg(self) -> None:
         """Background check for newer version on GitHub."""
         try:
             resp = urllib.request.urlopen(CHANGELOG_URL, timeout=5, context=_SSL_CTX)
             info = json.loads(resp.read().decode())
+            self._update_info = info
             if info.get("version", VERSION) != VERSION:
-                self._update_info = info
+                self._update_notified = True
+                self.call_from_thread(self._update_placeholder)
                 self.call_from_thread(
                     self._toast, f"Update available ({info['version']}) — /update", 5
                 )
+                self._send_update_notification(info["version"])
         except Exception:
             pass
 
