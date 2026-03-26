@@ -86,7 +86,7 @@ CONFIG_FILE = STATE_DIR / "config.json"
 AI_USAGE_FILE = STATE_DIR / "ai_usage.json"
 CRASH_LOG = STATE_DIR / "crash.log"
 
-VERSION = "1.0.2"
+VERSION = "1.0.3"
 UPDATE_FILES = ["timex.py", "menubar.py", "launcher.py", "serve.py"]
 UPDATE_BASE_URL = "https://raw.githubusercontent.com/halinskiy/timex/main"
 CHANGELOG_URL = f"{UPDATE_BASE_URL}/changelog.json"

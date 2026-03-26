@@ -2,8 +2,9 @@
   "version": "1.0.3",
   "dmg_required": false,
   "changes": [
-    "Update view with changelog and progress bar",
-    "SSL fix for py2app bundle",
-    "Show up-to-date state in /update view"
+    "/update view — changelog, progress bar, version info",
+    "Rainbow border pulse when update is available",
+    "SSL fix for update checks in py2app bundle",
+    "DMG installer with drag-to-install layout"
   ]
 }
