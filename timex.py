@@ -30,6 +30,7 @@ from pathlib import Path
 from zoneinfo import ZoneInfo
 import re
 import shutil
+import ssl
 import tempfile
 import urllib.request
 from dataclasses import dataclass, field
@@ -89,6 +90,13 @@ VERSION = "1.0.2"
 UPDATE_FILES = ["timex.py", "menubar.py", "launcher.py", "serve.py"]
 UPDATE_BASE_URL = "https://raw.githubusercontent.com/halinskiy/timex/main"
 CHANGELOG_URL = f"{UPDATE_BASE_URL}/changelog.json"
+_SSL_CTX = ssl.create_default_context()
+try:
+    import certifi
+    _SSL_CTX.load_verify_locations(certifi.where())
+except Exception:
+    _SSL_CTX.check_hostname = False
+    _SSL_CTX.verify_mode = ssl.CERT_NONE
 
 POPULAR_TIMEZONES = [
     "Europe/London",
@@ -4732,7 +4740,7 @@ class TimexApp(App):
     def _check_update_bg(self) -> None:
         """Background check for newer version on GitHub."""
         try:
-            resp = urllib.request.urlopen(CHANGELOG_URL, timeout=5)
+            resp = urllib.request.urlopen(CHANGELOG_URL, timeout=5, context=_SSL_CTX)
             info = json.loads(resp.read().decode())
             if info.get("version", VERSION) != VERSION:
                 self._update_info = info
@@ -4753,7 +4761,7 @@ class TimexApp(App):
 
     def _fetch_changelog_bg(self) -> None:
         try:
-            resp = urllib.request.urlopen(CHANGELOG_URL, timeout=5)
+            resp = urllib.request.urlopen(CHANGELOG_URL, timeout=5, context=_SSL_CTX)
             info = json.loads(resp.read().decode())
             self._update_info = info
             if info.get("version", VERSION) == VERSION:
@@ -4846,7 +4854,7 @@ class TimexApp(App):
             total = len(UPDATE_FILES)
             for i, fname in enumerate(UPDATE_FILES):
                 url = f"{UPDATE_BASE_URL}/{fname}"
-                resp = urllib.request.urlopen(url, timeout=15)
+                resp = urllib.request.urlopen(url, timeout=15, context=_SSL_CTX)
                 data = resp.read()
                 tmp_fd, tmp_path = tempfile.mkstemp(dir=app_dir, prefix=f".{fname}.")
                 try:
