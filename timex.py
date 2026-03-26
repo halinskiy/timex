@@ -30,6 +30,8 @@ from pathlib import Path
 from zoneinfo import ZoneInfo
 import re
 import shutil
+import tempfile
+import urllib.request
 from dataclasses import dataclass, field
 
 from textual.app import App, ComposeResult
@@ -82,6 +84,10 @@ AUTOSAVE_INTERVAL = 30  # seconds between autosaves during tick
 CONFIG_FILE = STATE_DIR / "config.json"
 AI_USAGE_FILE = STATE_DIR / "ai_usage.json"
 CRASH_LOG = STATE_DIR / "crash.log"
+
+VERSION = "1.0.2"
+UPDATE_FILES = ["timex.py", "menubar.py", "launcher.py", "serve.py"]
+UPDATE_BASE_URL = "https://raw.githubusercontent.com/halinskiy/timex/main"
 
 POPULAR_TIMEZONES = [
     "Europe/London",
@@ -149,9 +155,9 @@ class TaskEntry:
 # ── Command suggestions ──────────────────────────────────────────────────────
 
 STATE_COMMANDS: dict[str, list[str]] = {
-    IDLE:    ["/start", "/new", "/date", "/stats", "/export", "/edit", "/clear", "/help", "/timezone", "/notification", "/color", "/project", "/reload"],
-    RUNNING: ["/add", "/remove", "/pause", "/sleep", "/watch", "/reset", "/new", "/clear", "/date", "/stats", "/export", "/edit", "/help", "/timezone", "/notification", "/color", "/project", "/reload"],
-    PAUSED:  ["/resume", "/watch", "/reset", "/new", "/clear", "/date", "/stats", "/export", "/edit", "/help", "/timezone", "/notification", "/color", "/project", "/reload"],
+    IDLE:    ["/start", "/new", "/date", "/stats", "/export", "/edit", "/clear", "/help", "/timezone", "/notification", "/color", "/project", "/update", "/reload"],
+    RUNNING: ["/pause", "/add", "/remove", "/sleep", "/watch", "/reset", "/new", "/clear", "/date", "/stats", "/export", "/edit", "/help", "/timezone", "/notification", "/color", "/project", "/update", "/reload"],
+    PAUSED:  ["/resume", "/watch", "/reset", "/new", "/clear", "/date", "/stats", "/export", "/edit", "/help", "/timezone", "/notification", "/color", "/project", "/update", "/reload"],
 }
 
 
@@ -558,6 +564,7 @@ class TimexApp(App):
         self._render_all()
         self._update_placeholder()
         self.query_one("#task-input", HistoryInput).focus()
+        threading.Thread(target=self._check_update_bg, daemon=True).start()
 
     def on_click(self) -> None:
         self.query_one("#task-input", HistoryInput).focus()
@@ -1034,6 +1041,8 @@ class TimexApp(App):
             self._cmd_reset()
         elif cmd == "/reload":
             self._cmd_reload()
+        elif cmd == "/update":
+            self._cmd_update()
         elif cmd == "/project":
             self._cmd_project()
         elif cmd == "/watch":
@@ -3842,7 +3851,8 @@ class TimexApp(App):
                 if i > 1:
                     rows.append(Text.from_markup(f"[{SEPARATOR}]{'─' * 50}[/]"))
                 # Read project state to show status
-                pstate, ptime = self._read_project_status(name)
+                pstate, ptime, pwatch = self._read_project_status(name)
+                watch_icon = f" [{self._accent}]\u25c9[/]" if pwatch else ""
                 if pstate == RUNNING:
                     status = f"[bold {self._accent}]\u25cf REC     {ptime}[/]"
                 elif pstate == PAUSED:
@@ -3851,7 +3861,7 @@ class TimexApp(App):
                     status = f"[{DIM}]\u25cb IDLE[/]"
                 marker = f" [{self._accent}]\u2022[/]" if name == self._project else ""
                 rows.append(self._space_between(
-                    f"[bold {self._accent}]{i}.[/] [{TEXT_COLOR}]{name}[/]{marker}",
+                    f"[bold {self._accent}]{i}.[/]{watch_icon} [{TEXT_COLOR}]{name}[/]{marker}",
                     status,
                 ))
 
@@ -3862,23 +3872,24 @@ class TimexApp(App):
 
         self.query_one("#history", Static).update(Group(*rows))
 
-    def _read_project_status(self, name: str) -> tuple[str, str]:
-        """Read a project's state.json and return (state, formatted_time)."""
+    def _read_project_status(self, name: str) -> tuple[str, str, bool]:
+        """Read a project's state.json and return (state, formatted_time, watch_active)."""
+        # Watch only runs on current project — never show for others
+        watch_on = (name == self._project and self._watch_mode is not None)
         sf = PROJECTS_DIR / name / "state.json"
         try:
             if not sf.exists():
-                return IDLE, ""
+                return IDLE, "", False
             data = json.loads(sf.read_text())
             state = data.get("state", IDLE)
             # Calculate active seconds from saved data
             total_paused_secs = data.get("total_paused_secs", 0.0)
             session_start_str = data.get("session_start")
             if not session_start_str:
-                return state, self._fmt_time(data.get("final_active", 0.0))
+                return state, self._fmt_time(data.get("final_active", 0.0)), watch_on
             session_start = datetime.fromisoformat(session_start_str)
             now = self._now()
             if state == RUNNING:
-                # Real-time elapsed for all RUNNING projects (including background)
                 elapsed = (now - session_start).total_seconds() - total_paused_secs
             elif state == PAUSED:
                 paused_at_str = data.get("paused_at")
@@ -3887,10 +3898,10 @@ class TimexApp(App):
                 else:
                     elapsed = 0.0
             else:
-                return IDLE, self._fmt_time(data.get("final_active", 0.0))
-            return state, self._fmt_time(max(0.0, elapsed))
+                return IDLE, self._fmt_time(data.get("final_active", 0.0)), watch_on
+            return state, self._fmt_time(max(0.0, elapsed)), watch_on
         except (OSError, json.JSONDecodeError, KeyError, ValueError):
-            return IDLE, ""
+            return IDLE, "", False
 
     def _select_project(self, raw: str) -> None:
         projects = []
@@ -3918,6 +3929,9 @@ class TimexApp(App):
 
     def _switch_project(self, name: str) -> None:
         """Switch to a project (create dir if needed). Keeps current state as-is."""
+        if name == self._project:
+            self._leave_view()
+            return
         # Stop watch before switching (watch is per-project)
         if self._watch_mode is not None:
             self._stop_watch()
@@ -3947,7 +3961,7 @@ class TimexApp(App):
         self._last_session_tasks = []
         self._last_saved_at = ""
 
-        self._load_state()
+        self._load_state(preserve_running=True)
         self._leave_view(f"Switched to {name}")
 
     # ── Project Edit ──────────────────────────────────────────────────
@@ -3981,7 +3995,7 @@ class TimexApp(App):
         for i, name in enumerate(projects):
             if i > 0:
                 rows.append(Text.from_markup(f"[{SEPARATOR}]{'─' * 50}[/]"))
-            pstate, ptime = self._read_project_status(name)
+            pstate, ptime, _ = self._read_project_status(name)
             if pstate == RUNNING:
                 status = f"[bold {self._accent}]● REC     {ptime}[/]"
             elif pstate == PAUSED:
@@ -4607,7 +4621,7 @@ class TimexApp(App):
                         pass
         return total
 
-    def _load_state(self) -> None:
+    def _load_state(self, preserve_running: bool = False) -> None:
         try:
             sf = self._state_file()
             if not sf.exists():
@@ -4627,19 +4641,22 @@ class TimexApp(App):
             self.session_start = datetime.fromisoformat(session_start_str) if session_start_str else None
 
             if saved_state in (RUNNING, PAUSED):
-                if saved_state == RUNNING:
-                    # Was running — pause at the moment of last save.
-                    # When user resumes, (now - paused_at) covers offline.
+                if saved_state == RUNNING and preserve_running:
+                    # Project switch — was running moments ago, keep running
+                    self.paused_at = None
+                    self.state = RUNNING
+                elif saved_state == RUNNING:
+                    # Cold start — pause at the moment of last save
                     saved_at_str = data.get("saved_at")
                     if saved_at_str:
                         self.paused_at = datetime.fromisoformat(saved_at_str)
                     else:
                         self.paused_at = self._now()
+                    self.state = PAUSED
                 else:    # Was already paused — keep original paused_at.
                     paused_at_str = data.get("paused_at")
                     self.paused_at = datetime.fromisoformat(paused_at_str) if paused_at_str else self._now()
-
-                self.state = PAUSED
+                    self.state = PAUSED
                 self._reset_reminder()
 
                 # Never restore watch mode on app restart — user must enable manually
@@ -4700,6 +4717,43 @@ class TimexApp(App):
         except OSError:
             pass
 
+
+    # ── Auto-update ────────────────────────────────────────────────────────
+
+    def _check_update_bg(self) -> None:
+        """Background check for newer version on GitHub."""
+        try:
+            resp = urllib.request.urlopen(
+                f"{UPDATE_BASE_URL}/version.txt", timeout=5
+            )
+            remote = resp.read().decode().strip()
+            if remote != VERSION:
+                self.call_from_thread(
+                    self._toast, f"Update available ({remote}) — /update", 5
+                )
+        except Exception:
+            pass
+
+    def _cmd_update(self) -> None:
+        self._toast("Updating...")
+        threading.Thread(target=self._do_update, daemon=True).start()
+
+    def _do_update(self) -> None:
+        try:
+            app_dir = Path(__file__).parent
+            for fname in UPDATE_FILES:
+                url = f"{UPDATE_BASE_URL}/{fname}"
+                resp = urllib.request.urlopen(url, timeout=15)
+                data = resp.read()
+                tmp_fd, tmp_path = tempfile.mkstemp(dir=app_dir, prefix=f".{fname}.")
+                try:
+                    os.write(tmp_fd, data)
+                finally:
+                    os.close(tmp_fd)
+                Path(tmp_path).replace(app_dir / fname)
+            self.call_from_thread(self._cmd_reload)
+        except Exception as exc:
+            self.call_from_thread(self._toast, f"Update failed: {exc}", 5)
 
     def _cmd_reload(self) -> None:
         """Reload the app — writes flag, exits; launcher watches and reloads."""
