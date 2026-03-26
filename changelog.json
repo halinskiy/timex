@@ -1,0 +1,8 @@
+{
+  "version": "1.0.2",
+  "dmg_required": false,
+  "changes": [
+    "Auto-update — check for new versions on startup",
+    "/update command — download and apply updates in-app"
+  ]
+}

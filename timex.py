@@ -88,6 +88,7 @@ CRASH_LOG = STATE_DIR / "crash.log"
 VERSION = "1.0.2"
 UPDATE_FILES = ["timex.py", "menubar.py", "launcher.py", "serve.py"]
 UPDATE_BASE_URL = "https://raw.githubusercontent.com/halinskiy/timex/main"
+CHANGELOG_URL = f"{UPDATE_BASE_URL}/changelog.json"
 
 POPULAR_TIMEZONES = [
     "Europe/London",
@@ -484,6 +485,8 @@ class TimexApp(App):
         self._project_editing: int | None = None  # index of project being renamed
         self._project_to_delete: str | None = None  # project name pending deletion
         self._project: str | None = None  # active project name
+        self._update_info: dict | None = None  # cached changelog from GitHub
+        self._update_progress: float = -1  # -1=idle, 0..1=downloading, 2=done
         self._sleep_at: float = 0.0  # monotonic time when /sleep should fire
 
         # ── Watch (window activity monitor) ──
@@ -830,6 +833,10 @@ class TimexApp(App):
             scroll.border_title = "Watch"
             self._render_watch()
             return
+        if self._view_mode == "update":
+            scroll.border_title = "Update"
+            self._render_update()
+            return
         if self._view_mode == "dates":
             scroll.border_title = "History"
             self._render_dates_list()
@@ -1067,6 +1074,8 @@ class TimexApp(App):
             self._select_confirm_reset(raw)
         elif self._view_mode == "watch":
             self._select_watch(raw)
+        elif self._view_mode == "update":
+            self._select_update(raw)
         elif self._view_mode == "export":
             self._select_export(raw)
         elif raw.startswith("/"):
@@ -4723,25 +4732,119 @@ class TimexApp(App):
     def _check_update_bg(self) -> None:
         """Background check for newer version on GitHub."""
         try:
-            resp = urllib.request.urlopen(
-                f"{UPDATE_BASE_URL}/version.txt", timeout=5
-            )
-            remote = resp.read().decode().strip()
-            if remote != VERSION:
+            resp = urllib.request.urlopen(CHANGELOG_URL, timeout=5)
+            info = json.loads(resp.read().decode())
+            if info.get("version", VERSION) != VERSION:
+                self._update_info = info
                 self.call_from_thread(
-                    self._toast, f"Update available ({remote}) — /update", 5
+                    self._toast, f"Update available ({info['version']}) — /update", 5
                 )
         except Exception:
             pass
 
     def _cmd_update(self) -> None:
-        self._toast("Updating...")
+        self._update_progress = -1
+        if self._update_info is None:
+            # Fetch changelog if not cached from startup check
+            self._enter_view("update", "  /back to return")
+            threading.Thread(target=self._fetch_changelog_bg, daemon=True).start()
+        else:
+            self._enter_view("update", "  Enter 1 to update • /back to return")
+
+    def _fetch_changelog_bg(self) -> None:
+        try:
+            resp = urllib.request.urlopen(CHANGELOG_URL, timeout=5)
+            info = json.loads(resp.read().decode())
+            self._update_info = info
+            if info.get("version", VERSION) == VERSION:
+                self.call_from_thread(self._toast, "Already up to date", 3)
+                self.call_from_thread(self._leave_view)
+            else:
+                self.call_from_thread(self._render_history)
+                inp = self.query_one("#task-input", HistoryInput)
+                self.call_from_thread(setattr, inp, "placeholder", "  Enter 1 to update • /back to return")
+        except Exception as exc:
+            self.call_from_thread(self._toast, f"Cannot check for updates: {exc}", 5)
+            self.call_from_thread(self._leave_view)
+
+    def _render_update(self) -> None:
+        info = self._update_info
+        rows = []
+
+        if info is None:
+            rows.append(Text(""))
+            rows.append(Text.from_markup(f"  [{DIM}]Checking for updates...[/]"))
+            self.query_one("#history", Static).update(Group(*rows))
+            return
+
+        remote_ver = info.get("version", "?")
+        changes = info.get("changes", [])
+        dmg_required = info.get("dmg_required", False)
+
+        # Header: version
+        rows.append(self._space_between(
+            f"[bold {TEXT_COLOR}]Current version[/]",
+            f"[bold {DIM}]{VERSION}[/]",
+        ))
+        rows.append(self._space_between(
+            f"[bold {TEXT_COLOR}]New version[/]",
+            f"[bold {self._accent}]{remote_ver}[/]",
+        ))
+        rows.append(Text.from_markup(f"[{SEPARATOR}]{'─' * 50}[/]"))
+
+        # Changelog
+        rows.append(Text.from_markup(f"[bold {self._accent}]What's new[/]"))
+        rows.append(Text(""))
+        for change in changes:
+            rows.append(Text.from_markup(f"  [{TEXT_COLOR}]• {change}[/]"))
+        rows.append(Text(""))
+        rows.append(Text.from_markup(f"[{SEPARATOR}]{'─' * 50}[/]"))
+
+        # Progress bar / button / DMG message
+        if self._update_progress >= 0 and self._update_progress < 2:
+            # Progress bar
+            bar_w = 46
+            filled = int(bar_w * self._update_progress)
+            empty = bar_w - filled
+            bar = f"[{self._accent}]{'█' * filled}[/][{DIMMER}]{'░' * empty}[/]"
+            pct = int(self._update_progress * 100)
+            rows.append(Text.from_markup(f"  {bar} [{DIM}]{pct}%[/]"))
+        elif self._update_progress == 2:
+            rows.append(Text.from_markup(
+                f"  [bold {self._accent}]Update complete — reloading...[/]"
+            ))
+        elif dmg_required:
+            rows.append(Text.from_markup(
+                f"  [{TEXT_COLOR}]This update requires a new app download.[/]"
+            ))
+            rows.append(Text(""))
+            rows.append(Text.from_markup(
+                f"  [bold {self._accent}]→[/] [{TEXT_COLOR}]https://github.com/halinskiy/timex/releases/latest[/]"
+            ))
+        else:
+            rows.append(Text.from_markup(
+                f"[bold {self._accent}]1.[/] [{TEXT_COLOR}]Update to {remote_ver}[/]"
+            ))
+
+        self.query_one("#history", Static).update(Group(*rows))
+
+    def _select_update(self, raw: str) -> None:
+        if raw != "1":
+            return
+        info = self._update_info
+        if not info or info.get("dmg_required", False):
+            return
+        if self._update_progress >= 0:
+            return  # already updating
+        self._update_progress = 0
+        self._render_history()
         threading.Thread(target=self._do_update, daemon=True).start()
 
     def _do_update(self) -> None:
         try:
             app_dir = Path(__file__).parent
-            for fname in UPDATE_FILES:
+            total = len(UPDATE_FILES)
+            for i, fname in enumerate(UPDATE_FILES):
                 url = f"{UPDATE_BASE_URL}/{fname}"
                 resp = urllib.request.urlopen(url, timeout=15)
                 data = resp.read()
@@ -4751,8 +4854,15 @@ class TimexApp(App):
                 finally:
                     os.close(tmp_fd)
                 Path(tmp_path).replace(app_dir / fname)
+                self._update_progress = (i + 1) / total
+                self.call_from_thread(self._render_history)
+            self._update_progress = 2
+            self.call_from_thread(self._render_history)
+            _time.sleep(1)
             self.call_from_thread(self._cmd_reload)
         except Exception as exc:
+            self._update_progress = -1
+            self.call_from_thread(self._render_history)
             self.call_from_thread(self._toast, f"Update failed: {exc}", 5)
 
     def _cmd_reload(self) -> None:
