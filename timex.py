@@ -1331,6 +1331,8 @@ class TimexApp(App):
         self.query_one("#history", Static).update(Group(*rows))
 
     def _select_confirm_reset(self, raw: str) -> None:
+        if raw.lower() not in ("y", "yes", "n", "no"):
+            return
         if raw.lower() in ("y", "yes"):
             self.state = IDLE
             self.tasks = []
@@ -1373,6 +1375,8 @@ class TimexApp(App):
         self.query_one("#history", Static).update(Group(*rows))
 
     def _select_confirm_create_sheets(self, raw: str) -> None:
+        if raw.lower() not in ("y", "yes", "n", "no"):
+            return
         if raw.lower() in ("y", "yes"):
             self._toast("Creating sheets...", 10)
             ctx = dict(self._confirm_sheets_ctx)
@@ -3114,10 +3118,10 @@ class TimexApp(App):
 
                 if tracker_ws is None or report_ws is None:
                     missing = []
-                    if tracker_ws is None:
-                        missing.append(f"Tracker {current_month}")
                     if report_ws is None:
                         missing.append("Report")
+                    if tracker_ws is None:
+                        missing.append(f"Tracker {current_month}")
                     self._confirm_sheets_ctx = {"spreadsheet_id": ssid, "missing": missing}
                     self.call_from_thread(self._enter_confirm_create_sheets, missing)
                     return
@@ -4550,6 +4554,8 @@ class TimexApp(App):
         self.query_one("#history", Static).update(Group(*rows))
 
     def _select_confirm_delete_project(self, raw: str) -> None:
+        if raw.lower() not in ("y", "yes", "n", "no"):
+            return
         if raw.lower() in ("y", "yes"):
             name = self._project_to_delete
             if name:
