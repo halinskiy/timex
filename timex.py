@@ -493,6 +493,7 @@ class TimexApp(App):
         self._edit_index: int = 0  # selected task index in edit mode
         self._editing_task: int | None = None  # index of task being renamed
         self._export_connecting: bool = False  # waiting for spreadsheet URL paste
+        self._confirm_sheets_ctx: dict = {}  # context for confirm_create_sheets view
         self._project_edit_index: int = 0  # selected project in project_edit
         self._project_editing: int | None = None  # index of project being renamed
         self._project_to_delete: str | None = None  # project name pending deletion
@@ -500,6 +501,7 @@ class TimexApp(App):
         self._update_info: dict | None = None  # cached changelog from GitHub
         self._update_progress: float = -1  # -1=idle, 0..1=downloading, 2=done
         self._update_notified: bool = False  # enables gradient border + placeholder
+        self._input_wait_t: float = 0.0  # 0.0=accent, 1.0=blue (smooth transition)
         self._sleep_at: float = 0.0  # monotonic time when /sleep should fire
 
         # ── Watch (window activity monitor) ──
@@ -725,7 +727,7 @@ class TimexApp(App):
                 if now - self._last_autosave >= AUTOSAVE_INTERVAL:
                     self._last_autosave = now
                     self._save_state()
-            elif self._update_notified:
+            elif self._update_notified or self._is_input_waiting() or self._input_wait_t > 0.0:
                 self._render_footer()
         except Exception:
             CRASH_LOG.parent.mkdir(parents=True, exist_ok=True)
@@ -851,6 +853,10 @@ class TimexApp(App):
         if self._view_mode == "update":
             scroll.border_title = "Update"
             self._render_update()
+            return
+        if self._view_mode == "confirm_create_sheets":
+            scroll.border_title = "Create Sheets"
+            self._render_confirm_create_sheets()
             return
         if self._view_mode == "dates":
             scroll.border_title = "History"
@@ -1007,10 +1013,46 @@ class TimexApp(App):
         b = int(b1 + (b2 - b1) * frac)
         return f"#{r:02x}{g:02x}{b:02x}"
 
+    def _is_input_waiting(self) -> bool:
+        """True when app is waiting for freeform text from user."""
+        if self._export_connecting:
+            return True
+        if self._view_mode == "edit" and self._editing_task is not None:
+            return True
+        if self._view_mode == "project_edit" and self._project_editing is not None:
+            return True
+        if self._view_mode in ("timezone", "notification", "confirm_create_sheets"):
+            return True
+        return False
+
+    def _waiting_border_color(self) -> str:
+        """Interpolate accent → blue based on _input_wait_t (0.0–1.0)."""
+        # Parse accent hex
+        a = self._accent.lstrip("#")
+        r1, g1, b1 = int(a[0:2], 16), int(a[2:4], 16), int(a[4:6], 16)
+        r2, g2, b2 = 0x61, 0xaf, 0xef  # #61afef Blue
+        t = self._input_wait_t
+        r = int(r1 + (r2 - r1) * t)
+        g = int(g1 + (g2 - g1) * t)
+        b = int(b1 + (b2 - b1) * t)
+        return f"#{r:02x}{g:02x}{b:02x}"
+
     def _render_footer(self) -> None:
+        # Animate input border: accent ↔ blue based on waiting state
+        waiting = self._is_input_waiting()
+        step = 0.15  # per tick (0.5s) → ~3s full transition
+        if waiting:
+            self._input_wait_t = min(1.0, self._input_wait_t + step)
+        else:
+            self._input_wait_t = max(0.0, self._input_wait_t - step)
+
         inp = self.query_one("#task-input", HistoryInput)
         if self._update_notified and self._view_mode == "timeline":
             inp.styles.border = ("tall", self._update_gradient_color())
+        elif self._input_wait_t > 0.0:
+            inp.styles.border = ("tall", self._waiting_border_color())
+        else:
+            inp.styles.border = ("tall", self._accent)
         today = self._now().strftime("%a, %b %d %Y")
         parts = [f"[{DIM}]{today}[/]"]
         if self._watch_mode is not None:
@@ -1126,6 +1168,8 @@ class TimexApp(App):
             self._select_confirm_delete_project(raw)
         elif self._view_mode == "confirm_reset":
             self._select_confirm_reset(raw)
+        elif self._view_mode == "confirm_create_sheets":
+            self._select_confirm_create_sheets(raw)
         elif self._view_mode == "watch":
             self._select_watch(raw)
         elif self._view_mode == "update":
@@ -1303,6 +1347,125 @@ class TimexApp(App):
             self._save_state()
         else:
             self._leave_view("Reset cancelled")
+
+    # ── Confirm Create Sheets ─────────────────────────────────────────────
+
+    def _enter_confirm_create_sheets(self, missing: list) -> None:
+        self._confirm_sheets_ctx["missing"] = missing
+        self._enter_view("confirm_create_sheets", "  y to create, n to cancel")
+
+    def _render_confirm_create_sheets(self) -> None:
+        missing = self._confirm_sheets_ctx.get("missing", [])
+        rows = [
+            Text(""),
+            Text.from_markup(f"[bold {self._accent}]Missing sheets in your spreadsheet:[/]"),
+            Text(""),
+        ]
+        for name in missing:
+            rows.append(Text.from_markup(f"  [{TEXT_COLOR}]• {name}[/]"))
+        rows += [
+            Text(""),
+            Text.from_markup(f"[{SEPARATOR}]{'─' * 50}[/]"),
+            Text.from_markup(f"[bold {self._accent}]y.[/] [{TEXT_COLOR}]Create from template and sync[/]"),
+            Text.from_markup(f"[{SEPARATOR}]{'─' * 50}[/]"),
+            Text.from_markup(f"[bold {self._accent}]n.[/] [{TEXT_COLOR}]Cancel[/]"),
+        ]
+        self.query_one("#history", Static).update(Group(*rows))
+
+    def _select_confirm_create_sheets(self, raw: str) -> None:
+        if raw.lower() in ("y", "yes"):
+            self._toast("Creating sheets...", 10)
+            ctx = dict(self._confirm_sheets_ctx)
+
+            def _do_create():
+                try:
+                    self._create_template_sheets(ctx["spreadsheet_id"], ctx["missing"], self._sync_dt)
+                    self.call_from_thread(self._enter_view, "export", "  select option \u2022 /back")
+                    self.call_from_thread(self._select_export, "1")
+                except Exception as e:
+                    self.call_from_thread(self._toast, f"Create error: {e}", 6)
+                    self.call_from_thread(self._enter_view, "export", "  select option \u2022 /back")
+
+            threading.Thread(target=_do_create, daemon=True).start()
+        else:
+            self._enter_view("export", "  select option \u2022 /back")
+
+    @staticmethod
+    def _create_template_sheets(spreadsheet_id: str, missing_names: list, sync_dt) -> None:
+        """Create missing 'Tracker {Month}' and/or 'Report' sheets from a clean template."""
+        import calendar as _calendar
+
+        gc, _creds = TimexApp._get_gspread_client()
+        spreadsheet = gc.open_by_key(spreadsheet_id)
+
+        for sheet_name in missing_names:
+            if sheet_name.lower().startswith("tracker"):
+                ws = spreadsheet.add_worksheet(sheet_name, rows=200, cols=5)
+                ws.update("A1", [["#", "Start", "End", "Task", "Duration"]], value_input_option="RAW")
+                sid = ws.id
+                spreadsheet.batch_update({"requests": [
+                    # Column widths: A=40, B=80, C=80, D=300, E=80
+                    {"updateDimensionProperties": {"range": {"sheetId": sid, "dimension": "COLUMNS",
+                        "startIndex": 0, "endIndex": 1}, "properties": {"pixelSize": 40}, "fields": "pixelSize"}},
+                    {"updateDimensionProperties": {"range": {"sheetId": sid, "dimension": "COLUMNS",
+                        "startIndex": 1, "endIndex": 2}, "properties": {"pixelSize": 80}, "fields": "pixelSize"}},
+                    {"updateDimensionProperties": {"range": {"sheetId": sid, "dimension": "COLUMNS",
+                        "startIndex": 2, "endIndex": 3}, "properties": {"pixelSize": 80}, "fields": "pixelSize"}},
+                    {"updateDimensionProperties": {"range": {"sheetId": sid, "dimension": "COLUMNS",
+                        "startIndex": 3, "endIndex": 4}, "properties": {"pixelSize": 300}, "fields": "pixelSize"}},
+                    {"updateDimensionProperties": {"range": {"sheetId": sid, "dimension": "COLUMNS",
+                        "startIndex": 4, "endIndex": 5}, "properties": {"pixelSize": 80}, "fields": "pixelSize"}},
+                    # Header row: dark bg, light text, bold
+                    {"repeatCell": {
+                        "range": {"sheetId": sid, "startRowIndex": 0, "endRowIndex": 1,
+                                  "startColumnIndex": 0, "endColumnIndex": 5},
+                        "cell": {"userEnteredFormat": {
+                            "backgroundColor": {"red": 0.102, "green": 0.102, "blue": 0.102},
+                            "textFormat": {"bold": True, "foregroundColorStyle": {
+                                "rgbColor": {"red": 0.831, "green": 0.831, "blue": 0.831}}},
+                            "horizontalAlignment": "CENTER",
+                        }},
+                        "fields": "userEnteredFormat(backgroundColor,textFormat,horizontalAlignment)",
+                    }},
+                ]})
+            elif sheet_name.lower() == "report":
+                year = sync_dt.year
+                month = sync_dt.month
+                days_in_month = _calendar.monthrange(year, month)[1]
+                header = [["Дата", "Проект", "Описание и отчет", "Hours", "Link to detailed report"]]
+                date_rows = [
+                    [f"{day:02d}.{month:02d}.{year}", "", "", "", ""]
+                    for day in range(1, days_in_month + 1)
+                ]
+                total_row = [["Total", "", "", f"=SUM(D2:D{days_in_month + 1})", ""]]
+                ws = spreadsheet.add_worksheet(sheet_name, rows=days_in_month + 10, cols=5)
+                ws.update("A1", header + date_rows + total_row, value_input_option="USER_ENTERED")
+                sid = ws.id
+                spreadsheet.batch_update({"requests": [
+                    # Column widths: A=100, B=150, C=300, D=80, E=200
+                    {"updateDimensionProperties": {"range": {"sheetId": sid, "dimension": "COLUMNS",
+                        "startIndex": 0, "endIndex": 1}, "properties": {"pixelSize": 100}, "fields": "pixelSize"}},
+                    {"updateDimensionProperties": {"range": {"sheetId": sid, "dimension": "COLUMNS",
+                        "startIndex": 1, "endIndex": 2}, "properties": {"pixelSize": 150}, "fields": "pixelSize"}},
+                    {"updateDimensionProperties": {"range": {"sheetId": sid, "dimension": "COLUMNS",
+                        "startIndex": 2, "endIndex": 3}, "properties": {"pixelSize": 300}, "fields": "pixelSize"}},
+                    {"updateDimensionProperties": {"range": {"sheetId": sid, "dimension": "COLUMNS",
+                        "startIndex": 3, "endIndex": 4}, "properties": {"pixelSize": 80}, "fields": "pixelSize"}},
+                    {"updateDimensionProperties": {"range": {"sheetId": sid, "dimension": "COLUMNS",
+                        "startIndex": 4, "endIndex": 5}, "properties": {"pixelSize": 200}, "fields": "pixelSize"}},
+                    # Header row: dark bg, light text, bold
+                    {"repeatCell": {
+                        "range": {"sheetId": sid, "startRowIndex": 0, "endRowIndex": 1,
+                                  "startColumnIndex": 0, "endColumnIndex": 5},
+                        "cell": {"userEnteredFormat": {
+                            "backgroundColor": {"red": 0.102, "green": 0.102, "blue": 0.102},
+                            "textFormat": {"bold": True, "foregroundColorStyle": {
+                                "rgbColor": {"red": 0.831, "green": 0.831, "blue": 0.831}}},
+                            "horizontalAlignment": "CENTER",
+                        }},
+                        "fields": "userEnteredFormat(backgroundColor,textFormat,horizontalAlignment)",
+                    }},
+                ]})
 
     # ── Watch (window activity monitor) ───────────────────────────────────
 
@@ -2476,6 +2639,30 @@ class TimexApp(App):
         cfg.parent.mkdir(parents=True, exist_ok=True)
         cfg.write_text(json.dumps({"spreadsheet_id": sid}))
 
+    def _render_connect_sheet(self) -> None:
+        """Show instructions for connecting an existing spreadsheet."""
+        rows = []
+        rows.append(Text.from_markup(f"[bold {self._accent}]Connect Existing Spreadsheet[/]"))
+        rows.append(Text.from_markup(f"[{SEPARATOR}]{'─' * 50}[/]"))
+        rows.append(Text(""))
+        rows.append(Text.from_markup(f"  [bold {self._accent}]1.[/] [{TEXT_COLOR}]Open Google Sheets in your browser[/]"))
+        rows.append(Text(""))
+        rows.append(Text.from_markup(f"  [bold {self._accent}]2.[/] [{TEXT_COLOR}]Find a spreadsheet with this format:[/]"))
+        rows.append(Text.from_markup(f"      [{DIM}]Report on Hours / Name for Project[/]"))
+        rows.append(Text(""))
+        rows.append(Text.from_markup(f"  [bold {self._accent}]3.[/] [{TEXT_COLOR}]Copy the URL from the address bar[/]"))
+        rows.append(Text.from_markup(f"      [{DIM}]docs.google.com/spreadsheets/d/...[/]"))
+        rows.append(Text(""))
+        rows.append(Text.from_markup(f"  [bold {self._accent}]4.[/] [{TEXT_COLOR}]Paste it below and press Enter[/]"))
+        rows.append(Text(""))
+        rows.append(Text.from_markup(f"[{SEPARATOR}]{'─' * 50}[/]"))
+        has_sheet = self._get_sync_spreadsheet_id() is not None
+        if has_sheet:
+            rows.append(Text.from_markup(
+                f"  [{DIM}]This will replace the currently connected sheet[/]"
+            ))
+        self.query_one("#history", Static).update(Group(*rows))
+
     def _connect_spreadsheet_url(self, raw: str) -> None:
         """Parse a Google Sheets URL and save the spreadsheet ID."""
         # Extract spreadsheet ID from URL: docs.google.com/spreadsheets/d/{ID}/...
@@ -2515,7 +2702,13 @@ class TimexApp(App):
         if not creds or not creds.valid:
             if creds and creds.expired and creds.refresh_token:
                 from google.auth.transport.requests import Request
-                creds.refresh(Request())
+                try:
+                    creds.refresh(Request())
+                except Exception:
+                    # Refresh token revoked/expired — re-authorize
+                    token_path.unlink(missing_ok=True)
+                    flow = InstalledAppFlow.from_client_secrets_file(str(client_secret_path), SCOPES)
+                    creds = flow.run_local_server(port=0)
             else:
                 flow = InstalledAppFlow.from_client_secrets_file(str(client_secret_path), SCOPES)
                 creds = flow.run_local_server(port=0)
@@ -2635,10 +2828,13 @@ class TimexApp(App):
 
     def _render_export(self) -> None:
         """Render export view with date, task count, total, and options."""
+        if self._export_connecting:
+            self._render_connect_sheet()
+            return
         dt = self._sync_dt
         date_long = getattr(self, "_sync_date_long", dt.strftime("%A, %B ") + str(dt.day) + dt.strftime(", %Y"))
-        month_name = dt.strftime("%b")
-        sheet_name = f"[{month_name} days report]"
+        current_month = dt.strftime("%B")
+        sheet_name = f"Tracker {current_month}"
         n = len(self._sync_tasks)
         total = self._fmt_time(self._sync_total_secs)
 
@@ -2663,15 +2859,19 @@ class TimexApp(App):
             ))
             rows.append(Text.from_markup(f"[{SEPARATOR}]{'─' * 50}[/]"))
             rows.append(Text.from_markup(
-                f"[bold {self._accent}]2.[/] [{TEXT_COLOR}]Clear from Google Sheets[/]"
+                f"[bold {self._accent}]2.[/] [{TEXT_COLOR}]Connect Existing Spreadsheet[/]"
             ))
             rows.append(Text.from_markup(f"[{SEPARATOR}]{'─' * 50}[/]"))
             rows.append(Text.from_markup(
-                f"[bold {self._accent}]3.[/] [{TEXT_COLOR}]Export to Excel (.xlsx)[/]"
+                f"[bold {self._accent}]3.[/] [{TEXT_COLOR}]Clear from Google Sheets[/]"
             ))
             rows.append(Text.from_markup(f"[{SEPARATOR}]{'─' * 50}[/]"))
             rows.append(Text.from_markup(
-                f"[bold {self._accent}]4.[/] [{TEXT_COLOR}]Open in Browser[/]"
+                f"[bold {self._accent}]4.[/] [{TEXT_COLOR}]Export to Excel (.xlsx)[/]"
+            ))
+            rows.append(Text.from_markup(f"[{SEPARATOR}]{'─' * 50}[/]"))
+            rows.append(Text.from_markup(
+                f"[bold {self._accent}]5.[/] [{TEXT_COLOR}]Open in Browser[/]"
             ))
         else:
             rows.append(Text.from_markup(
@@ -2689,7 +2889,10 @@ class TimexApp(App):
         self.query_one("#history", Static).update(Group(*rows))
 
     def _select_export(self, raw: str) -> None:
-        """Handle export view selection. With sheet: 1=sync, 2=clear, 3=xlsx, 4=open. Without: 1=create&sync, 2=connect, 3=xlsx."""
+        """Handle export view selection.
+        With sheet: 1=sync, 2=connect, 3=clear, 4=xlsx, 5=open.
+        Without:    1=create&sync, 2=connect, 3=xlsx.
+        """
         has_sheet = self._get_sync_spreadsheet_id() is not None
 
         # Connect mode: user is pasting a URL
@@ -2698,19 +2901,26 @@ class TimexApp(App):
             self._connect_spreadsheet_url(raw)
             return
 
-        if not has_sheet:
-            if raw == "2":
-                # Connect Existing Spreadsheet — ask for URL
-                self._export_connecting = True
-                inp = self.query_one("#task-input", HistoryInput)
-                inp.placeholder = "  Paste Google Sheets URL • /back"
-                return
-            if raw == "3":
-                pass  # xlsx — fall through to raw == "3" below
-            elif raw != "1":
-                return
+        # Connect Existing Spreadsheet — "2" in both modes
+        if raw == "2":
+            self._export_connecting = True
+            self._render_connect_sheet()
+            inp = self.query_one("#task-input", HistoryInput)
+            inp.placeholder = "  Paste URL here \u2022 /back to cancel"
+            return
 
-        if raw in ("1", "2"):
+        # Map to unified actions based on mode
+        if has_sheet:
+            # 1=sync, 3=clear, 4=xlsx, 5=open
+            action = {"1": "sync", "3": "clear", "4": "xlsx", "5": "open"}.get(raw)
+        else:
+            # 1=create&sync, 3=xlsx
+            action = {"1": "sync", "3": "xlsx"}.get(raw)
+
+        if not action:
+            return
+
+        if action in ("sync", "clear"):
             token_path = STATE_DIR / "oauth_token.json"
             client_secret_path = STATE_DIR / "client_secret.json"
             if not token_path.exists() and not client_secret_path.exists():
@@ -2726,7 +2936,7 @@ class TimexApp(App):
                 self._toast("gspread required — pip install gspread google-auth google-auth-oauthlib", 5)
                 return
 
-        if raw == "1":
+        if action == "sync":
             self._toast("Syncing...", 10)
             sync_dt = self._sync_dt
             task_entries = self._sync_tasks
@@ -2744,38 +2954,45 @@ class TimexApp(App):
                         # Spreadsheet deleted — create new one
                         ssid = None
                 if not ssid:
-                    title = f"Report on Hours / Kostiantyn Halynskyi for {self._project}"
+                    title = f"[{self._project}] Report on Hours / Kostiantyn Halynskyi"
                     spreadsheet = gc.create(title)
                     ssid = spreadsheet.id
                     self._save_sync_spreadsheet_id(ssid)
 
-                month_name = sync_dt.strftime("%b")
+                current_month = sync_dt.strftime("%B")  # e.g. "April"
 
-                # Auto-create worksheets if missing
-                try:
-                    days_sheet = spreadsheet.worksheet(f"[{month_name} days report]")
-                except gspread.exceptions.WorksheetNotFound:
-                    days_sheet = spreadsheet.add_worksheet(f"[{month_name} days report]", rows=100, cols=20)
-                    # Remove default sheet (Sheet1/Лист1) — delete any sheet that isn't ours
-                    for ws in spreadsheet.worksheets():
-                        if ws.id != days_sheet.id:
-                            try:
-                                spreadsheet.del_worksheet(ws)
-                            except Exception:
-                                pass
+                # Find "Tracker {Month}" and "Report" sheets (no deletions)
+                tracker_ws = None
+                report_ws = None
+                for ws in spreadsheet.worksheets():
+                    title_lower = ws.title.lower()
+                    if "tracker" in title_lower and current_month.lower() in title_lower:
+                        tracker_ws = ws
+                    elif "report" in title_lower:
+                        report_ws = ws
 
-                sheet_id = days_sheet.id
+                if tracker_ws is None or report_ws is None:
+                    missing = []
+                    if tracker_ws is None:
+                        missing.append(f"Tracker {current_month}")
+                    if report_ws is None:
+                        missing.append("Report")
+                    self._confirm_sheets_ctx = {"spreadsheet_id": ssid, "missing": missing}
+                    self.call_from_thread(self._enter_confirm_create_sheets, missing)
+                    return
+
+                sheet_id = tracker_ws.id
 
                 date_long = self._sync_date_long
                 date_search = self._sync_date_search
-                all_vals = days_sheet.get_all_values()
+                all_vals = tracker_ws.get_all_values()
 
                 # Calculate new table size: title + date + gap/warning + header + tasks + total
                 n_tasks = len(task_entries)
                 new_rows = 3 + 1 + n_tasks + 1  # title, date, gap/warning, header, tasks, total
 
                 # Find and clear existing table (inserts/deletes rows if size differs)
-                start_row = self._find_and_clear_table(days_sheet, spreadsheet, sheet_id, date_long, all_vals,
+                start_row = self._find_and_clear_table(tracker_ws, spreadsheet, sheet_id, date_long, all_vals,
                                                        creds=creds, spreadsheet_id=ssid,
                                                        new_rows=new_rows, alt_date_longs=date_search)
 
@@ -2813,7 +3030,7 @@ class TimexApp(App):
 
                 rows.append(["", "", "", "TOTAL", self._fmt_time(total_secs)])
 
-                days_sheet.update(f"A{start_row}", rows, value_input_option="RAW")
+                tracker_ws.update(f"A{start_row}", rows, value_input_option="RAW")
 
                 # ── Formatting via batch_update ──
                 r0 = start_row - 1
@@ -2970,56 +3187,44 @@ class TimexApp(App):
                     }}
                 ]})
 
-                # ── Update Link in monthly summary tab ──
+                # ── Update link in Report sheet (column E next to today's date) ──
                 try:
                     link_uri = f"#gid={sheet_id}&range=A{start_row}"
                     link_dates = self._sync_link_dates
-
-                    # Group dates by month for cross-month support
-                    from collections import defaultdict
-                    dates_by_month = defaultdict(list)
+                    report_vals = report_ws.col_values(1)
+                    report_id = report_ws.id
+                    link_requests = []
                     for d in link_dates:
-                        dates_by_month[datetime.combine(d, datetime.min.time()).strftime("%b")].append(
-                            d.strftime("%d.%m.%Y"))
-
-                    for mtab, date_keys in dates_by_month.items():
-                        try:
-                            summary_sheet = spreadsheet.worksheet(mtab)
-                            summary_id = summary_sheet.id
-                            summary_vals = summary_sheet.get_all_values()
-                            link_requests = []
-                            for date_key in date_keys:
-                                for ri, row in enumerate(summary_vals):
-                                    if row and row[0] == date_key:
-                                        link_requests.append({
-                                            "updateCells": {
-                                                "range": {
-                                                    "sheetId": summary_id,
-                                                    "startRowIndex": ri,
-                                                    "endRowIndex": ri + 1,
-                                                    "startColumnIndex": 4,
-                                                    "endColumnIndex": 5,
+                        date_key = d.strftime("%d.%m.%Y")
+                        for ri, cell_val in enumerate(report_vals):
+                            if cell_val.strip() == date_key:
+                                link_requests.append({
+                                    "updateCells": {
+                                        "range": {
+                                            "sheetId": report_id,
+                                            "startRowIndex": ri,
+                                            "endRowIndex": ri + 1,
+                                            "startColumnIndex": 4,
+                                            "endColumnIndex": 5,
+                                        },
+                                        "rows": [{"values": [{
+                                            "userEnteredValue": {"stringValue": "\u2192 View"},
+                                            "userEnteredFormat": {
+                                                "horizontalAlignment": "CENTER",
+                                                "verticalAlignment": "MIDDLE",
+                                                "textFormat": {
+                                                    "fontSize": 11,
+                                                    "link": {"uri": link_uri},
                                                 },
-                                                "rows": [{"values": [{
-                                                    "userEnteredValue": {"stringValue": "Link"},
-                                                    "userEnteredFormat": {
-                                                        "horizontalAlignment": "CENTER",
-                                                        "verticalAlignment": "MIDDLE",
-                                                        "textFormat": {
-                                                            "fontSize": 12,
-                                                            "link": {"uri": link_uri},
-                                                        },
-                                                        "hyperlinkDisplayType": "LINKED",
-                                                    },
-                                                }]}],
-                                                "fields": "userEnteredValue,userEnteredFormat(horizontalAlignment,verticalAlignment,textFormat,hyperlinkDisplayType)",
+                                                "hyperlinkDisplayType": "LINKED",
                                             },
-                                        })
-                                        break
-                            if link_requests:
-                                spreadsheet.batch_update({"requests": link_requests})
-                        except Exception:
-                            pass  # Summary tab may not exist for this month
+                                        }]}],
+                                        "fields": "userEnteredValue,userEnteredFormat(horizontalAlignment,verticalAlignment,textFormat,hyperlinkDisplayType)",
+                                    },
+                                })
+                                break
+                    if link_requests:
+                        spreadsheet.batch_update({"requests": link_requests})
                 except Exception:
                     pass  # Link creation is cosmetic; don't fail sync
 
@@ -3040,7 +3245,7 @@ class TimexApp(App):
 
             threading.Thread(target=_sync_thread, daemon=True).start()
 
-        elif raw == "2":
+        elif action == "clear":
             self._toast("Clearing...", 10)
             sync_dt = self._sync_dt
 
@@ -3053,8 +3258,15 @@ class TimexApp(App):
                 gc, creds = self._get_gspread_client()
                 spreadsheet = gc.open_by_key(ssid)
 
-                month_name = sync_dt.strftime("%b")
-                days_sheet = spreadsheet.worksheet(f"[{month_name} days report]")
+                current_month = sync_dt.strftime("%B")  # e.g. "April"
+                days_sheet = None
+                for ws in spreadsheet.worksheets():
+                    if "tracker" in ws.title.lower() and current_month.lower() in ws.title.lower():
+                        days_sheet = ws
+                        break
+                if days_sheet is None:
+                    self.call_from_thread(self._toast, f"No 'Tracker {current_month}' sheet found")
+                    return
                 sheet_id = days_sheet.id
 
                 date_long = self._sync_date_long
@@ -3130,7 +3342,7 @@ class TimexApp(App):
 
             threading.Thread(target=_clear_thread, daemon=True).start()
 
-        elif raw == "3":
+        elif action == "xlsx":
             # ── Export to Excel (.xlsx) ──
             try:
                 from openpyxl import Workbook
@@ -3195,7 +3407,7 @@ class TimexApp(App):
 
             self._leave_view(f"Saved \u2192 ~/Downloads/{filename}")
 
-        elif raw == "4":
+        elif action == "open":
             ssid = self._get_sync_spreadsheet_id()
             if ssid:
                 import webbrowser
@@ -3203,9 +3415,6 @@ class TimexApp(App):
                 self._toast("Opened in browser")
             else:
                 self._toast("No spreadsheet yet")
-
-        else:
-            self._toast("Enter a valid option")
 
     @staticmethod
     def _delete_native_table(creds, spreadsheet_id, sheet_id, start_row_idx, end_row_idx):
@@ -4485,7 +4694,7 @@ class TimexApp(App):
         elif self._view_mode == "project_edit":
             self._project_editing = None
             self._enter_view("project", "  Enter number or type new project name • /back to return")
-        elif self._view_mode in ("dates", "help", "timezone", "notification", "edit", "color", "stats", "project", "watch", "confirm_reset", "export", "update"):
+        elif self._view_mode in ("dates", "help", "timezone", "notification", "edit", "color", "stats", "project", "watch", "confirm_reset", "export", "update", "confirm_create_sheets"):
             self._editing_task = None
             self._leave_view()
         else:
@@ -4754,6 +4963,12 @@ class TimexApp(App):
 
     def _send_reminder(self) -> None:
         """Show in-app + macOS system notification."""
+        # Guard against double-fire (e.g. after system wake queuing multiple ticks)
+        now = _time.monotonic()
+        if now - getattr(self, '_last_notify_at', 0.0) < 10.0:
+            return
+        self._last_notify_at = now
+
         elapsed_str = self._fmt_time(self._active_seconds())
         current_task = self.tasks[-1].name if self.tasks and self.tasks[-1].active_end is None else None
 

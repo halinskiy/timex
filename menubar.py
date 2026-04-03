@@ -189,21 +189,21 @@ class TimexMenuBar(rumps.App):
 
         self._stop_item.set_callback(None)  # disabled initially
 
-        self._tick_count: int = 0  # seconds since last flip
-        self._showing_alt: bool = False  # True = showing the "alt" text
-
         self._timer = rumps.Timer(self._tick, 1)
         self._timer.start()
 
     # ── Tick ──────────────────────────────────────────────────────────────
 
+    # Fixed-width title so other menu bar icons don't shift
+    _FMT_IDLE    = "○  00:00:00"
+    _FMT_RUNNING = "●  {}"
+    _FMT_PAUSED  = "⏸  {}"
+
     def _tick(self, _sender=None) -> None:
         data = _read_state()
-        proj = _active_project_name()
-        pname = proj[:10] + "\u2026" if proj and len(proj) > 11 else proj
 
         if data is None:
-            self.title = f"○ {pname}" if pname else "○ Timex"
+            self.title = self._FMT_IDLE
             self._set_idle_menu()
             return
 
@@ -211,35 +211,14 @@ class TimexMenuBar(rumps.App):
         active = _all_sessions_active()
         time_str = _fmt_time(active)
 
-        # Alternate between timer and project name
-        # RUNNING: show timer (primary), flash project name for 5s every 60s
-        # PAUSED:  show project name (primary), flash timer for 5s every 60s
-        self._tick_count += 1
-        if pname and state in (RUNNING, PAUSED):
-            cycle = self._tick_count % 65  # 60s primary + 5s alt
-            should_alt = cycle >= 60
-            if should_alt != self._showing_alt:
-                self._showing_alt = should_alt
-
-            if state == RUNNING:
-                if self._showing_alt:
-                    self.title = f"● {pname}"
-                else:
-                    self.title = f"● {time_str}"
-            else:  # PAUSED
-                if self._showing_alt:
-                    self.title = f"⏸ {time_str}"
-                else:
-                    self.title = f"⏸ {pname}"
-            self._set_running_menu() if state == RUNNING else self._set_paused_menu()
-        elif state == RUNNING:
-            self.title = f"● {time_str}"
+        if state == RUNNING:
+            self.title = self._FMT_RUNNING.format(time_str)
             self._set_running_menu()
         elif state == PAUSED:
-            self.title = f"⏸ {time_str}"
+            self.title = self._FMT_PAUSED.format(time_str)
             self._set_paused_menu()
         else:
-            self.title = f"○ {pname}" if pname else "○ Timex"
+            self.title = self._FMT_IDLE
             self._set_idle_menu()
 
     # ── Menu state ────────────────────────────────────────────────────────
