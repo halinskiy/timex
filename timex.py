@@ -1392,80 +1392,193 @@ class TimexApp(App):
 
     @staticmethod
     def _create_template_sheets(spreadsheet_id: str, missing_names: list, sync_dt) -> None:
-        """Create missing 'Tracker {Month}' and/or 'Report' sheets from a clean template."""
+        """Create missing 'Tracker {Month}' and/or 'Report' sheets matching the original template."""
         import calendar as _calendar
+        from datetime import date as _date
+
+        # Google Sheets date serial: days since 1899-12-30
+        _EPOCH = _date(1899, 12, 30)
+
+        def _date_serial(year, month, day):
+            return (_date(year, month, day) - _EPOCH).days
 
         gc, _creds = TimexApp._get_gspread_client()
         spreadsheet = gc.open_by_key(spreadsheet_id)
 
         for sheet_name in missing_names:
             if sheet_name.lower().startswith("tracker"):
-                ws = spreadsheet.add_worksheet(sheet_name, rows=200, cols=5)
-                ws.update("A1", [["#", "Start", "End", "Task", "Duration"]], value_input_option="RAW")
+                ws = spreadsheet.add_worksheet(sheet_name, rows=500, cols=5)
                 sid = ws.id
                 spreadsheet.batch_update({"requests": [
-                    # Column widths: A=40, B=80, C=80, D=300, E=80
+                    # Column widths matching template: A=39, B=115, C=80, D=444, E=100
                     {"updateDimensionProperties": {"range": {"sheetId": sid, "dimension": "COLUMNS",
-                        "startIndex": 0, "endIndex": 1}, "properties": {"pixelSize": 40}, "fields": "pixelSize"}},
+                        "startIndex": 0, "endIndex": 1}, "properties": {"pixelSize": 39}, "fields": "pixelSize"}},
                     {"updateDimensionProperties": {"range": {"sheetId": sid, "dimension": "COLUMNS",
-                        "startIndex": 1, "endIndex": 2}, "properties": {"pixelSize": 80}, "fields": "pixelSize"}},
+                        "startIndex": 1, "endIndex": 2}, "properties": {"pixelSize": 115}, "fields": "pixelSize"}},
                     {"updateDimensionProperties": {"range": {"sheetId": sid, "dimension": "COLUMNS",
                         "startIndex": 2, "endIndex": 3}, "properties": {"pixelSize": 80}, "fields": "pixelSize"}},
                     {"updateDimensionProperties": {"range": {"sheetId": sid, "dimension": "COLUMNS",
-                        "startIndex": 3, "endIndex": 4}, "properties": {"pixelSize": 300}, "fields": "pixelSize"}},
+                        "startIndex": 3, "endIndex": 4}, "properties": {"pixelSize": 444}, "fields": "pixelSize"}},
                     {"updateDimensionProperties": {"range": {"sheetId": sid, "dimension": "COLUMNS",
-                        "startIndex": 4, "endIndex": 5}, "properties": {"pixelSize": 80}, "fields": "pixelSize"}},
-                    # Header row: dark bg, light text, bold
-                    {"repeatCell": {
-                        "range": {"sheetId": sid, "startRowIndex": 0, "endRowIndex": 1,
-                                  "startColumnIndex": 0, "endColumnIndex": 5},
-                        "cell": {"userEnteredFormat": {
-                            "backgroundColor": {"red": 0.102, "green": 0.102, "blue": 0.102},
-                            "textFormat": {"bold": True, "foregroundColorStyle": {
-                                "rgbColor": {"red": 0.831, "green": 0.831, "blue": 0.831}}},
-                            "horizontalAlignment": "CENTER",
-                        }},
-                        "fields": "userEnteredFormat(backgroundColor,textFormat,horizontalAlignment)",
-                    }},
+                        "startIndex": 4, "endIndex": 5}, "properties": {"pixelSize": 100}, "fields": "pixelSize"}},
                 ]})
+
             elif sheet_name.lower() == "report":
                 year = sync_dt.year
                 month = sync_dt.month
                 days_in_month = _calendar.monthrange(year, month)[1]
-                header = [["Дата", "Проект", "Описание и отчет", "Hours", "Link to detailed report"]]
-                date_rows = [
-                    [f"{day:02d}.{month:02d}.{year}", "", "", "", ""]
-                    for day in range(1, days_in_month + 1)
-                ]
-                total_row = [["Total", "", "", f"=SUM(D2:D{days_in_month + 1})", ""]]
-                ws = spreadsheet.add_worksheet(sheet_name, rows=days_in_month + 10, cols=5)
-                ws.update("A1", header + date_rows + total_row, value_input_option="USER_ENTERED")
+                n = days_in_month
+                total_row_idx = n + 1  # 1-indexed, row after last date
+
+                ws = spreadsheet.add_worksheet(sheet_name, rows=n + 10, cols=5)
                 sid = ws.id
-                spreadsheet.batch_update({"requests": [
-                    # Column widths: A=100, B=150, C=300, D=80, E=200
+
+                # Write header as text
+                ws.update("A1", [["Дата", "Проект", "Описание и отчет", "Hours",
+                                  "Link to detailed report"]], value_input_option="RAW")
+
+                # Write dates as serial numbers (actual date values, not strings)
+                date_vals = [[_date_serial(year, month, d), "", "", "", ""]
+                             for d in range(1, n + 1)]
+                ws.update(f"A2:E{n + 1}", date_vals, value_input_option="RAW")
+
+                # Write Total row
+                ws.update(f"A{total_row_idx + 1}",
+                          [["Total", "", "", f"=SUM(D2:D{n + 1})", ""]],
+                          value_input_option="USER_ENTERED")
+
+                GRAY = {"red": 0.9529412, "green": 0.9529412, "blue": 0.9529412}
+                WHITE = {"red": 1.0, "green": 1.0, "blue": 1.0}
+                CREAM = {"red": 1.0, "green": 0.98039216, "blue": 0.92941177}
+                ORANGE = {"red": 1.0, "green": 0.42745098, "blue": 0.003921569}
+                BLACK = {"red": 0.0, "green": 0.0, "blue": 0.0}
+
+                requests = [
+                    # Column widths matching template: A=83, B=385, C=606, D=100, E=200
                     {"updateDimensionProperties": {"range": {"sheetId": sid, "dimension": "COLUMNS",
-                        "startIndex": 0, "endIndex": 1}, "properties": {"pixelSize": 100}, "fields": "pixelSize"}},
+                        "startIndex": 0, "endIndex": 1}, "properties": {"pixelSize": 83}, "fields": "pixelSize"}},
                     {"updateDimensionProperties": {"range": {"sheetId": sid, "dimension": "COLUMNS",
-                        "startIndex": 1, "endIndex": 2}, "properties": {"pixelSize": 150}, "fields": "pixelSize"}},
+                        "startIndex": 1, "endIndex": 2}, "properties": {"pixelSize": 385}, "fields": "pixelSize"}},
                     {"updateDimensionProperties": {"range": {"sheetId": sid, "dimension": "COLUMNS",
-                        "startIndex": 2, "endIndex": 3}, "properties": {"pixelSize": 300}, "fields": "pixelSize"}},
+                        "startIndex": 2, "endIndex": 3}, "properties": {"pixelSize": 606}, "fields": "pixelSize"}},
                     {"updateDimensionProperties": {"range": {"sheetId": sid, "dimension": "COLUMNS",
-                        "startIndex": 3, "endIndex": 4}, "properties": {"pixelSize": 80}, "fields": "pixelSize"}},
+                        "startIndex": 3, "endIndex": 4}, "properties": {"pixelSize": 100}, "fields": "pixelSize"}},
                     {"updateDimensionProperties": {"range": {"sheetId": sid, "dimension": "COLUMNS",
                         "startIndex": 4, "endIndex": 5}, "properties": {"pixelSize": 200}, "fields": "pixelSize"}},
-                    # Header row: dark bg, light text, bold
+                    # Row height: header=38px, data=37px
+                    {"updateDimensionProperties": {"range": {"sheetId": sid, "dimension": "ROWS",
+                        "startIndex": 0, "endIndex": 1}, "properties": {"pixelSize": 38}, "fields": "pixelSize"}},
+                    {"updateDimensionProperties": {"range": {"sheetId": sid, "dimension": "ROWS",
+                        "startIndex": 1, "endIndex": n + 2}, "properties": {"pixelSize": 37}, "fields": "pixelSize"}},
+                    # Freeze row 1 and col 1
+                    {"updateSheetProperties": {
+                        "properties": {"sheetId": sid, "gridProperties": {
+                            "frozenRowCount": 1, "frozenColumnCount": 1}},
+                        "fields": "gridProperties.frozenRowCount,gridProperties.frozenColumnCount",
+                    }},
+                    # Header row A: bold, CENTER, MIDDLE, bottom+right borders
                     {"repeatCell": {
                         "range": {"sheetId": sid, "startRowIndex": 0, "endRowIndex": 1,
-                                  "startColumnIndex": 0, "endColumnIndex": 5},
+                                  "startColumnIndex": 0, "endColumnIndex": 1},
                         "cell": {"userEnteredFormat": {
-                            "backgroundColor": {"red": 0.102, "green": 0.102, "blue": 0.102},
-                            "textFormat": {"bold": True, "foregroundColorStyle": {
-                                "rgbColor": {"red": 0.831, "green": 0.831, "blue": 0.831}}},
-                            "horizontalAlignment": "CENTER",
+                            "horizontalAlignment": "CENTER", "verticalAlignment": "MIDDLE",
+                            "textFormat": {"bold": True},
+                            "borders": {"bottom": {"style": "SOLID", "width": 1, "color": BLACK},
+                                        "right": {"style": "SOLID", "width": 1, "color": BLACK}},
                         }},
-                        "fields": "userEnteredFormat(backgroundColor,textFormat,horizontalAlignment)",
+                        "fields": "userEnteredFormat(horizontalAlignment,verticalAlignment,textFormat,borders)",
                     }},
-                ]})
+                    # Header B-C: CENTER, MIDDLE, bottom border
+                    {"repeatCell": {
+                        "range": {"sheetId": sid, "startRowIndex": 0, "endRowIndex": 1,
+                                  "startColumnIndex": 1, "endColumnIndex": 3},
+                        "cell": {"userEnteredFormat": {
+                            "horizontalAlignment": "CENTER", "verticalAlignment": "MIDDLE",
+                            "borders": {"bottom": {"style": "SOLID", "width": 1, "color": BLACK}},
+                        }},
+                        "fields": "userEnteredFormat(horizontalAlignment,verticalAlignment,borders)",
+                    }},
+                    # Header D-E: CENTER, MIDDLE, bottom+left+right borders
+                    {"repeatCell": {
+                        "range": {"sheetId": sid, "startRowIndex": 0, "endRowIndex": 1,
+                                  "startColumnIndex": 3, "endColumnIndex": 5},
+                        "cell": {"userEnteredFormat": {
+                            "horizontalAlignment": "CENTER", "verticalAlignment": "MIDDLE",
+                            "borders": {"bottom": {"style": "SOLID", "width": 1, "color": BLACK},
+                                        "left": {"style": "SOLID", "width": 1, "color": BLACK},
+                                        "right": {"style": "SOLID", "width": 1, "color": BLACK}},
+                        }},
+                        "fields": "userEnteredFormat(horizontalAlignment,verticalAlignment,borders)",
+                    }},
+                    # Col A data: DATE format, CENTER, MIDDLE, right border
+                    {"repeatCell": {
+                        "range": {"sheetId": sid, "startRowIndex": 1, "endRowIndex": n + 1,
+                                  "startColumnIndex": 0, "endColumnIndex": 1},
+                        "cell": {"userEnteredFormat": {
+                            "numberFormat": {"type": "DATE", "pattern": "dd.MM.yyyy"},
+                            "horizontalAlignment": "CENTER", "verticalAlignment": "MIDDLE",
+                            "borders": {"right": {"style": "SOLID", "width": 1, "color": BLACK}},
+                        }},
+                        "fields": "userEnteredFormat(numberFormat,horizontalAlignment,verticalAlignment,borders)",
+                    }},
+                    # Col B data: orange bold text, CENTER, MIDDLE
+                    {"repeatCell": {
+                        "range": {"sheetId": sid, "startRowIndex": 1, "endRowIndex": n + 1,
+                                  "startColumnIndex": 1, "endColumnIndex": 2},
+                        "cell": {"userEnteredFormat": {
+                            "horizontalAlignment": "CENTER", "verticalAlignment": "MIDDLE",
+                            "textFormat": {"bold": True,
+                                           "foregroundColorStyle": {"rgbColor": ORANGE}},
+                        }},
+                        "fields": "userEnteredFormat(horizontalAlignment,verticalAlignment,textFormat)",
+                    }},
+                    # Col C data: MIDDLE, WRAP
+                    {"repeatCell": {
+                        "range": {"sheetId": sid, "startRowIndex": 1, "endRowIndex": n + 1,
+                                  "startColumnIndex": 2, "endColumnIndex": 3},
+                        "cell": {"userEnteredFormat": {
+                            "verticalAlignment": "MIDDLE", "wrapStrategy": "WRAP",
+                        }},
+                        "fields": "userEnteredFormat(verticalAlignment,wrapStrategy)",
+                    }},
+                    # Col D data: cream bg, left+right borders, CENTER, MIDDLE, fontSize=14
+                    {"repeatCell": {
+                        "range": {"sheetId": sid, "startRowIndex": 1, "endRowIndex": n + 1,
+                                  "startColumnIndex": 3, "endColumnIndex": 4},
+                        "cell": {"userEnteredFormat": {
+                            "backgroundColor": CREAM,
+                            "horizontalAlignment": "CENTER", "verticalAlignment": "MIDDLE",
+                            "textFormat": {"fontSize": 14},
+                            "borders": {"left": {"style": "SOLID", "width": 1, "color": BLACK},
+                                        "right": {"style": "SOLID", "width": 1, "color": BLACK}},
+                        }},
+                        "fields": "userEnteredFormat(backgroundColor,horizontalAlignment,verticalAlignment,textFormat,borders)",
+                    }},
+                    # Col E data: right border, CENTER, MIDDLE, fontSize=12
+                    {"repeatCell": {
+                        "range": {"sheetId": sid, "startRowIndex": 1, "endRowIndex": n + 1,
+                                  "startColumnIndex": 4, "endColumnIndex": 5},
+                        "cell": {"userEnteredFormat": {
+                            "horizontalAlignment": "CENTER", "verticalAlignment": "MIDDLE",
+                            "textFormat": {"fontSize": 12},
+                            "borders": {"right": {"style": "SOLID", "width": 1, "color": BLACK}},
+                            "hyperlinkDisplayType": "LINKED",
+                        }},
+                        "fields": "userEnteredFormat(horizontalAlignment,verticalAlignment,textFormat,borders,hyperlinkDisplayType)",
+                    }},
+                ]
+
+                # Alternating row backgrounds: odd data rows (day 1,3,5...) = GRAY, even = WHITE
+                for i in range(n):
+                    bg = GRAY if i % 2 == 0 else WHITE
+                    requests.append({"repeatCell": {
+                        "range": {"sheetId": sid, "startRowIndex": i + 1, "endRowIndex": i + 2,
+                                  "startColumnIndex": 0, "endColumnIndex": 3},
+                        "cell": {"userEnteredFormat": {"backgroundColor": bg}},
+                        "fields": "userEnteredFormat(backgroundColor)",
+                    }})
+
+                spreadsheet.batch_update({"requests": requests})
 
     # ── Watch (window activity monitor) ───────────────────────────────────
 
@@ -2645,15 +2758,15 @@ class TimexApp(App):
         rows.append(Text.from_markup(f"[bold {self._accent}]Connect Existing Spreadsheet[/]"))
         rows.append(Text.from_markup(f"[{SEPARATOR}]{'─' * 50}[/]"))
         rows.append(Text(""))
-        rows.append(Text.from_markup(f"  [bold {self._accent}]1.[/] [{TEXT_COLOR}]Open Google Sheets in your browser[/]"))
+        rows.append(Text.from_markup(f"  [{DIM}]1.[/] [{TEXT_COLOR}]Open Google Sheets in your browser[/]"))
         rows.append(Text(""))
-        rows.append(Text.from_markup(f"  [bold {self._accent}]2.[/] [{TEXT_COLOR}]Find a spreadsheet with this format:[/]"))
+        rows.append(Text.from_markup(f"  [{DIM}]2.[/] [{TEXT_COLOR}]Find a spreadsheet with this format:[/]"))
         rows.append(Text.from_markup(f"      [{DIM}]Report on Hours / Name for Project[/]"))
         rows.append(Text(""))
-        rows.append(Text.from_markup(f"  [bold {self._accent}]3.[/] [{TEXT_COLOR}]Copy the URL from the address bar[/]"))
+        rows.append(Text.from_markup(f"  [{DIM}]3.[/] [{TEXT_COLOR}]Copy the URL from the address bar[/]"))
         rows.append(Text.from_markup(f"      [{DIM}]docs.google.com/spreadsheets/d/...[/]"))
         rows.append(Text(""))
-        rows.append(Text.from_markup(f"  [bold {self._accent}]4.[/] [{TEXT_COLOR}]Paste it below and press Enter[/]"))
+        rows.append(Text.from_markup(f"  [{DIM}]4.[/] [{TEXT_COLOR}]Paste it below and press Enter[/]"))
         rows.append(Text(""))
         rows.append(Text.from_markup(f"[{SEPARATOR}]{'─' * 50}[/]"))
         has_sheet = self._get_sync_spreadsheet_id() is not None
@@ -2962,13 +3075,14 @@ class TimexApp(App):
                 current_month = sync_dt.strftime("%B")  # e.g. "April"
 
                 # Find "Tracker {Month}" and "Report" sheets (no deletions)
+                # "Report" must start with "report" (not match old "[Apr days report]")
                 tracker_ws = None
                 report_ws = None
                 for ws in spreadsheet.worksheets():
                     title_lower = ws.title.lower()
                     if "tracker" in title_lower and current_month.lower() in title_lower:
                         tracker_ws = ws
-                    elif "report" in title_lower:
+                    elif title_lower == "report" or title_lower.startswith("report ") or title_lower.startswith("report\t"):
                         report_ws = ws
 
                 if tracker_ws is None or report_ws is None:
@@ -3188,8 +3302,9 @@ class TimexApp(App):
                 ]})
 
                 # ── Update link in Report sheet (column E next to today's date) ──
+                link_written = False
                 try:
-                    link_uri = f"#gid={sheet_id}&range=A{start_row}"
+                    link_url = f"https://docs.google.com/spreadsheets/d/{ssid}/edit#gid={sheet_id}&range=A{start_row}"
                     link_dates = self._sync_link_dates
                     report_vals = report_ws.col_values(1)
                     report_id = report_ws.id
@@ -3214,7 +3329,7 @@ class TimexApp(App):
                                                 "verticalAlignment": "MIDDLE",
                                                 "textFormat": {
                                                     "fontSize": 11,
-                                                    "link": {"uri": link_uri},
+                                                    "link": {"uri": link_url},
                                                 },
                                                 "hyperlinkDisplayType": "LINKED",
                                             },
@@ -3222,11 +3337,16 @@ class TimexApp(App):
                                         "fields": "userEnteredValue,userEnteredFormat(horizontalAlignment,verticalAlignment,textFormat,hyperlinkDisplayType)",
                                     },
                                 })
+                                link_written = True
                                 break
                     if link_requests:
                         spreadsheet.batch_update({"requests": link_requests})
-                except Exception:
-                    pass  # Link creation is cosmetic; don't fail sync
+                except Exception as _link_err:
+                    try:
+                        with open(CRASH_LOG, "a") as _f:
+                            _f.write(f"[report_link] {type(_link_err).__name__}: {_link_err}\n")
+                    except OSError:
+                        pass
 
                 n = len(task_entries)
                 total_fmt = self._fmt_time(total_secs)
@@ -3235,7 +3355,8 @@ class TimexApp(App):
                                   self._sync_link_dates[-1].strftime("%d.%m"))
                 else:
                     date_short = sync_dt.strftime("%d.%m")
-                self.call_from_thread(self._leave_view, f"Synced {date_short} \u2014 {n} tasks, {total_fmt}")
+                suffix = " + Report link" if link_written else ""
+                self.call_from_thread(self._leave_view, f"Synced {date_short} \u2014 {n} tasks, {total_fmt}{suffix}")
 
             def _sync_thread():
                 try:
