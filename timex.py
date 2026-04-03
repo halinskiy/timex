@@ -2746,11 +2746,32 @@ class TimexApp(App):
                 pass
         return None
 
-    def _save_sync_spreadsheet_id(self, sid: str) -> None:
-        """Save spreadsheet ID to per-project sheets_config.json."""
+    def _get_sync_spreadsheet_title(self) -> "str | None":
+        """Read cached spreadsheet title from per-project sheets_config.json."""
+        cfg = self._project_dir() / "sheets_config.json"
+        if cfg.exists():
+            try:
+                data = json.loads(cfg.read_text())
+                return data.get("title")
+            except (OSError, json.JSONDecodeError):
+                pass
+        return None
+
+    def _save_sync_spreadsheet_id(self, sid: str, title: "str | None" = None) -> None:
+        """Save spreadsheet ID (and optionally title) to per-project sheets_config.json."""
         cfg = self._project_dir() / "sheets_config.json"
         cfg.parent.mkdir(parents=True, exist_ok=True)
-        cfg.write_text(json.dumps({"spreadsheet_id": sid}))
+        # Preserve existing data
+        existing: dict = {}
+        if cfg.exists():
+            try:
+                existing = json.loads(cfg.read_text())
+            except (OSError, json.JSONDecodeError):
+                pass
+        existing["spreadsheet_id"] = sid
+        if title is not None:
+            existing["title"] = title
+        cfg.write_text(json.dumps(existing))
 
     def _render_connect_sheet(self) -> None:
         """Show instructions for connecting an existing spreadsheet."""
@@ -2916,7 +2937,9 @@ class TimexApp(App):
             def _verify_sheet():
                 try:
                     gc, creds = self._get_gspread_client()
-                    gc.open_by_key(ssid)
+                    sp = gc.open_by_key(ssid)
+                    self._save_sync_spreadsheet_id(ssid, sp.title)
+                    self.call_from_thread(self._render_export)
                 except Exception as e:
                     # Only reset if spreadsheet is confirmed gone (404/not found)
                     # Don't reset on network errors, timeouts, or auth issues
@@ -2954,9 +2977,13 @@ class TimexApp(App):
         has_sheet = self._get_sync_spreadsheet_id() is not None
 
         rows = []
-        rows.append(Text.from_markup(
-            f"[bold {self._accent}]Report on Hours[/] [{DIM}]/ Kostiantyn Halynskyi for[/] [{TEXT_COLOR}]{self._project}[/]"
-        ))
+        sheet_title = self._get_sync_spreadsheet_title() if has_sheet else None
+        if sheet_title:
+            rows.append(Text.from_markup(f"[{TEXT_COLOR}]{sheet_title}[/]"))
+        else:
+            rows.append(Text.from_markup(
+                f"[bold {self._accent}]Report on Hours[/] [{DIM}]/ Kostiantyn Halynskyi for[/] [{TEXT_COLOR}]{self._project}[/]"
+            ))
         rows.append(Text.from_markup(f"[{SEPARATOR}]{'─' * 50}[/]"))
         rows.append(Text.from_markup(f"[{DIM}]Date:[/]    [{TEXT_COLOR}]{date_long}[/]"))
         rows.append(Text.from_markup(f"[{DIM}]Tasks:[/]   [{TEXT_COLOR}]{n}[/]"))
@@ -3070,7 +3097,7 @@ class TimexApp(App):
                     title = f"[{self._project}] Report on Hours / Kostiantyn Halynskyi"
                     spreadsheet = gc.create(title)
                     ssid = spreadsheet.id
-                    self._save_sync_spreadsheet_id(ssid)
+                self._save_sync_spreadsheet_id(ssid, spreadsheet.title)
 
                 current_month = sync_dt.strftime("%B")  # e.g. "April"
 
