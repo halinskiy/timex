@@ -1383,7 +1383,8 @@ class TimexApp(App):
 
             def _do_create():
                 try:
-                    self._create_template_sheets(ctx["spreadsheet_id"], ctx["missing"], self._sync_dt)
+                    self._create_template_sheets(ctx["spreadsheet_id"], ctx["missing"], self._sync_dt,
+                                                delete_default=ctx.get("delete_default", False))
                     self.call_from_thread(self._enter_view, "export", "  select option \u2022 /back")
                     self.call_from_thread(self._select_export, "1")
                 except Exception as e:
@@ -1395,7 +1396,8 @@ class TimexApp(App):
             self._enter_view("export", "  select option \u2022 /back")
 
     @staticmethod
-    def _create_template_sheets(spreadsheet_id: str, missing_names: list, sync_dt) -> None:
+    def _create_template_sheets(spreadsheet_id: str, missing_names: list, sync_dt,
+                                delete_default: bool = False) -> None:
         """Create missing 'Tracker {Month}' and/or 'Report' sheets matching the original template."""
         import calendar as _calendar
         from datetime import date as _date
@@ -1583,6 +1585,16 @@ class TimexApp(App):
                     }})
 
                 spreadsheet.batch_update({"requests": requests})
+
+        # Delete default sheet (Sheet1 / Лист1) only for freshly created spreadsheets
+        if delete_default:
+            created_titles = {n.lower() for n in missing_names}
+            for ws in spreadsheet.worksheets():
+                if ws.title.lower() not in created_titles:
+                    try:
+                        spreadsheet.del_worksheet(ws)
+                    except Exception:
+                        pass
 
     # ── Watch (window activity monitor) ───────────────────────────────────
 
@@ -3091,6 +3103,7 @@ class TimexApp(App):
 
                 # Per-project spreadsheet: open existing or create new
                 ssid = self._get_sync_spreadsheet_id()
+                is_new_spreadsheet = False
                 if ssid:
                     try:
                         spreadsheet = gc.open_by_key(ssid)
@@ -3101,6 +3114,7 @@ class TimexApp(App):
                     title = f"[{self._project}] Report on Hours / Kostiantyn Halynskyi"
                     spreadsheet = gc.create(title)
                     ssid = spreadsheet.id
+                    is_new_spreadsheet = True
                 self._save_sync_spreadsheet_id(ssid, spreadsheet.title)
 
                 current_month = sync_dt.strftime("%B")  # e.g. "April"
@@ -3122,7 +3136,7 @@ class TimexApp(App):
                         missing.append("Report")
                     if tracker_ws is None:
                         missing.append(f"Tracker {current_month}")
-                    self._confirm_sheets_ctx = {"spreadsheet_id": ssid, "missing": missing}
+                    self._confirm_sheets_ctx = {"spreadsheet_id": ssid, "missing": missing, "delete_default": is_new_spreadsheet}
                     self.call_from_thread(self._enter_confirm_create_sheets, missing)
                     return
 
