@@ -1861,37 +1861,16 @@ class TimexApp(App):
         rows = []
 
         if self._watch_step == "window":
-            if self._watch_mode is not None:
-                # Track already active — show status + Off/Switch options
-                watch_lost = getattr(self, '_watch_lost', False)
-                if watch_lost:
-                    status = f"[bold #e06c75]\u26a0 Lost[/]"
-                elif self._watch_thinking:
-                    status = f"[bold #e06c75]Thinking[/]"
-                else:
-                    status = f"[bold #98c379]Working[/]"
-                rows.append(Text.from_markup(
-                    f"[bold {TEXT_COLOR}]Track active[/]"
-                ))
-                rows.append(Text.from_markup(
-                    f"[{DIM}]Window: {self._watch_window_name or 'Unknown'}[/]"
-                ))
-                rows.append(Text.from_markup(f"[{DIM}]Status: [/]{status}"))
-                rows.append(Text(""))
-                rows.append(Text.from_markup(f"[{SEPARATOR}]{'─' * 50}[/]"))
-                rows.append(Text.from_markup(
-                    f"[bold {self._accent}]0.[/] [{TEXT_COLOR}]Off[/]"
-                ))
-                rows.append(Text.from_markup(f"[{SEPARATOR}]{'─' * 50}[/]"))
-                # Show window list below for switching
-                if not self._watch_windows:
-                    self._watch_windows = self._get_window_list()
-
             if not self._watch_windows:
                 self._watch_windows = self._get_window_list()
             rows.append(Text.from_markup(
                 f"[bold {TEXT_COLOR}]Select window to track:[/]"
             ))
+            if self._watch_mode is not None:
+                rows.append(Text.from_markup(f"[{SEPARATOR}]{'─' * 50}[/]"))
+                rows.append(Text.from_markup(
+                    f"[bold {self._accent}]0.[/] [{TEXT_COLOR}]Off[/]  [{DIM}]({self._watch_window_name or 'active'})[/]"
+                ))
             max_up = max((w["uptime"] for w in self._watch_windows), default=0)
             for i, win in enumerate(self._watch_windows, start=1):
                 rows.append(Text.from_markup(f"[{SEPARATOR}]{'─' * 50}[/]"))
