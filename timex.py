@@ -523,6 +523,7 @@ class TimexApp(App):
         self._btn_cooldown: bool = False
         self._btn_action: str | None = None
         self._btn_release_timer = None
+        self._btn_press_mono: float = 0.0
         self._project_edit_index: int = 0  # selected project in project_edit
         self._project_editing: int | None = None  # index of project being renamed
         self._project_to_delete: str | None = None  # project name pending deletion
@@ -655,9 +656,10 @@ class TimexApp(App):
                 if self._btn_cooldown:
                     return  # ignore during post-action cooldown
                 if not self._btn_pressed:
-                    # First press — capture action, show pressed visual
+                    # First press — show pressed visual, NO timer
                     self._btn_pressed = True
                     self._btn_action = self.state
+                    self._btn_press_mono = _time.monotonic()
                     btn = self.query_one("#simple-btn", Static)
                     if self.state == RUNNING:
                         btn.styles.background = "#2a2a2a"
@@ -665,10 +667,8 @@ class TimexApp(App):
                         a = self._accent.lstrip("#")
                         r, g, b = int(a[0:2], 16), int(a[2:4], 16), int(a[4:6], 16)
                         btn.styles.background = f"#{int(r*0.75):02x}{int(g*0.75):02x}{int(b*0.75):02x}"
-                    # First timer: 350ms (wait for key repeat to start)
-                    self._btn_release_timer = self.set_timer(0.35, self._on_btn_release)
                 else:
-                    # Key repeat arrived → user is holding. Short debounce.
+                    # Key repeat → user is holding. Debounce for release.
                     if self._btn_release_timer is not None:
                         self._btn_release_timer.stop()
                     self._btn_release_timer = self.set_timer(0.15, self._on_btn_release)
@@ -875,6 +875,11 @@ class TimexApp(App):
                 self._render_footer()
             if self._ui_mode == "simple" and self._view_mode == "timeline":
                 self._update_simple_btn()
+            # Tap detection: pressed with no repeat timer → tap release
+            if (self._btn_pressed and not self._btn_cooldown
+                    and self._btn_release_timer is None
+                    and _time.monotonic() - self._btn_press_mono > 0.5):
+                self._on_btn_release()
         except Exception:
             CRASH_LOG.parent.mkdir(parents=True, exist_ok=True)
             CRASH_LOG.write_text(traceback.format_exc())
