@@ -356,6 +356,20 @@ def _bump_ai_usage() -> None:
         pass
 
 
+# ── Retry helper ────────────────────────────────────────────────────────────
+
+
+def _retry(fn, max_retries: int = 3, base_delay: float = 1.0):
+    """Retry fn with exponential backoff."""
+    for attempt in range(max_retries):
+        try:
+            return fn()
+        except Exception:
+            if attempt == max_retries - 1:
+                raise
+            _time.sleep(base_delay * (2 ** attempt))
+
+
 # ── Application ──────────────────────────────────────────────────────────────
 
 
@@ -444,7 +458,7 @@ class TimexApp(App):
         self._export_connecting = False
         if toast_msg:
             self._toast(toast_msg)
-        self._render_all()
+        self._mark_dirty()
         self._update_placeholder()
         self._apply_mode()
 
@@ -491,6 +505,7 @@ class TimexApp(App):
         self._accent_hex: str = DEFAULT_ACCENT_HEX
         self._last_reminder: float = 0.0
         self._last_autosave: float = 0.0
+        self._dirty_history: bool = True
         self._last_saved_at: str = ""  # track saved_at to detect external changes
         self._view_mode: str = "timeline"  # "timeline" | "dates" | "history_detail" | "help" | "timezone" | "notification" | "color"
         self._viewing_tasks: list[TaskEntry] = []
@@ -590,7 +605,7 @@ class TimexApp(App):
                 lambda: self.query_one("#task-input").styles.__setattr__("border", ("tall", self._accent))
             )
         self.set_interval(0.5, self._tick)
-        self._render_all()
+        self._mark_dirty()
         self._update_placeholder()
         self.call_after_refresh(self._apply_mode)
         threading.Thread(target=self._check_update_bg, daemon=True).start()
@@ -613,20 +628,6 @@ class TimexApp(App):
             btn.display = False
             inp.display = True
             inp.focus()
-
-    @staticmethod
-    def _blend_hex(fg: str, bg: str = "#171717", alpha: float = 0.1) -> str:
-        """Blend fg over bg at given alpha; return hex string."""
-        def p(h):
-            h = h.lstrip("#")
-            return int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16)
-        r1, g1, b1 = p(fg)
-        r0, g0, b0 = p(bg)
-        return "#{:02x}{:02x}{:02x}".format(
-            int(r0 + alpha * (r1 - r0)),
-            int(g0 + alpha * (g1 - g0)),
-            int(b0 + alpha * (b1 - b0)),
-        )
 
     def _update_simple_btn(self) -> None:
         btn = self.query_one("#simple-btn", Static)
@@ -762,7 +763,13 @@ class TimexApp(App):
         elif self.state == PAUSED and self.paused_at:
             elapsed = (self.paused_at - self.session_start) - self.total_paused
         elif self.state == PAUSED:
-            elapsed = (self._now() - self.session_start) - self.total_paused
+            self.paused_at = self._now()
+            try:
+                with open(CRASH_LOG, "a") as _f:
+                    _f.write(f"[state] PAUSED without paused_at, auto-fixed\n")
+            except OSError:
+                pass
+            elapsed = (self.paused_at - self.session_start) - self.total_paused
         else:
             elapsed = timedelta()
 
@@ -820,6 +827,7 @@ class TimexApp(App):
             self.paused_at = datetime.fromisoformat(paused_at_str) if paused_at_str else None
 
             self.state = saved_state
+            self._dirty_history = True
             if self._view_mode == "timeline":
                 self._render_all()
             self._update_placeholder()
@@ -851,8 +859,15 @@ class TimexApp(App):
 
     def _render_all(self) -> None:
         self._render_timer()
-        self._render_history()
+        if self._dirty_history:
+            self._render_history()
+            self._dirty_history = False
         self._render_footer()
+
+    def _mark_dirty(self) -> None:
+        """Mark history for re-render and trigger full render."""
+        self._dirty_history = True
+        self._render_all()
 
     def _render_timer(self) -> None:
         in_project_view = self._view_mode == "project"
@@ -1060,8 +1075,7 @@ class TimexApp(App):
             return
 
         # Group by date
-        from collections import OrderedDict
-        by_date: OrderedDict[str, list[dict]] = OrderedDict()
+        by_date: dict[str, list[dict]] = {}
         for session in reversed(history):
             d = session.get("date", "unknown")
             by_date.setdefault(d, []).append(session)
@@ -1314,8 +1328,8 @@ class TimexApp(App):
             self._cmd_resume()
             return
         if self.state == RUNNING:
-            # Already running — save history and reset for new day
-            self._save_history()
+            # Already running — build history entry BEFORE resetting state
+            entry = self._build_history_entry()
             self.state = IDLE
             self.tasks = []
             self._last_session_tasks = []
@@ -1325,10 +1339,12 @@ class TimexApp(App):
             self._final_active = 0.0
             self._stop_watch()
             self._view_mode = "timeline"
+            self._save_state()  # persist clean state first
+            if entry:
+                self._append_history(entry)  # then append history
             self._toast("Session saved \u2014 new day started")
             self._update_placeholder()
-            self._render_all()
-            self._save_state()
+            self._mark_dirty()
             return
 
         # IDLE — start the timer
@@ -1342,7 +1358,7 @@ class TimexApp(App):
         self._reset_reminder()
         self._toast("Timer started")
         self._update_placeholder()
-        self._render_all()
+        self._mark_dirty()
         self._save_state()
 
     def _cmd_pause(self) -> None:
@@ -1355,7 +1371,7 @@ class TimexApp(App):
         self._reset_reminder()
         self._toast("Timer paused")
         self._update_placeholder()
-        self._render_all()
+        self._mark_dirty()
         self._save_state()
 
     def _cmd_sleep(self, raw: str) -> None:
@@ -1429,7 +1445,7 @@ class TimexApp(App):
         self._reset_reminder()
         self._toast("Timer resumed")
         self._update_placeholder()
-        self._render_all()
+        self._mark_dirty()
         self._save_state()
 
     def _cmd_reset(self) -> None:
@@ -2038,7 +2054,7 @@ class TimexApp(App):
         # Create initial "thinking" task — AI will replace it with real name
         self._add_task("\u23f3 ...")
         self._save_state()
-        self._render_all()
+        self._mark_dirty()
 
     def _stop_watch(self) -> None:
         # Remove any placeholder/thinking task (⏳ ... or ⏳ Thinking)
@@ -2049,7 +2065,7 @@ class TimexApp(App):
                 self.tasks[-1].active_end = None
                 self.tasks[-1].wall_end = None
             self._watch_thinking = False
-            self._render_all()
+            self._mark_dirty()
             self._save_state()
         self._watch_generation += 1
         self._watch_mode = None
@@ -2086,11 +2102,12 @@ class TimexApp(App):
         self._watch_last_check = now
 
         # Run heavy screenshot/focus work in background thread
+        wmode = self._watch_mode  # snapshot before thread start
         def _bg_check():
             try:
-                if self._watch_mode == "screenshot":
+                if wmode == "screenshot":
                     result = self._check_watch_screenshot()
-                elif self._watch_mode == "focus":
+                elif wmode == "focus":
                     result = self._check_watch_focus()
                 else:
                     result = (True, -1.0)
@@ -2129,7 +2146,7 @@ class TimexApp(App):
                     self._watch_same_streak = 0
                     # Force early AI check to rename quickly
                     self._watch_last_ai_check = _time.monotonic() - 170.0
-                    self._render_all()
+                    self._mark_dirty()
                     self._save_state()
                 else:
                     # Inactivity thinking (⏳ Thinking) — remove and reopen previous
@@ -2140,7 +2157,7 @@ class TimexApp(App):
                             self.tasks[-1].wall_end = None
                     self._watch_thinking = False
                     self._watch_prev_task = None
-                    self._render_all()
+                    self._mark_dirty()
                     self._save_state()
         else:
             inactive_secs = now - self._watch_last_active
@@ -2686,7 +2703,7 @@ class TimexApp(App):
         if self.tasks and self.tasks[-1].active_end is None and self.tasks[-1].name == "\u23f3 ...":
             self.tasks[-1].name = label
             self._save_state()
-            self._render_all()
+            self._mark_dirty()
             return
         # If current task is less than 5 minutes old, rename instead of creating new
         # But never rename a task the user named manually
@@ -2696,7 +2713,7 @@ class TimexApp(App):
                 self._ai_log(f"task too young ({task_age:.0f}s < 300s), renaming: '{label}'")
                 self.tasks[-1].name = label
                 self._save_state()
-                self._render_all()
+                self._mark_dirty()
                 return
         self._watch_user_named = False
         self._add_task(label)
@@ -2864,7 +2881,7 @@ class TimexApp(App):
             self._watch_thinking = False
             self._watch_last_active = _time.monotonic()
 
-        self._render_all()
+        self._mark_dirty()
         self._save_state()
 
         # Scroll to bottom
@@ -3219,6 +3236,10 @@ class TimexApp(App):
             sync_dt = self._sync_dt
             task_entries = self._sync_tasks
             active = self._active_seconds()
+            date_long = self._sync_date_long
+            date_search = self._sync_date_search
+            watch_used = self._sync_watch_used
+            link_dates = list(self._sync_link_dates) if self._sync_link_dates else []
 
             def _do_sync():
                 gc, creds = self._get_gspread_client()
@@ -3264,8 +3285,6 @@ class TimexApp(App):
 
                 sheet_id = tracker_ws.id
 
-                date_long = self._sync_date_long
-                date_search = self._sync_date_search
                 all_vals = tracker_ws.get_all_values()
 
                 # Calculate new table size: title + date + gap/warning + header + tasks + total
@@ -3280,7 +3299,6 @@ class TimexApp(App):
                 rows = []
                 rows.append(["\u23f1 Time Report", "", "", "", ""])
                 rows.append([date_long, "", "", "", ""])
-                watch_used = self._sync_watch_used
                 if watch_used:
                     rows.append(["", "", "\u26a0\ufe0f Tracker under Test Mode \u26a0\ufe0f", "", ""])
                 else:
@@ -3311,7 +3329,7 @@ class TimexApp(App):
 
                 rows.append(["", "", "", "TOTAL", self._fmt_time(total_secs)])
 
-                tracker_ws.update(f"A{start_row}", rows, value_input_option="RAW")
+                _retry(lambda: tracker_ws.update(f"A{start_row}", rows, value_input_option="RAW"))
 
                 # ── Formatting via batch_update ──
                 r0 = start_row - 1
@@ -3436,7 +3454,7 @@ class TimexApp(App):
                         "backgroundColor": bg,
                     }))
 
-                spreadsheet.batch_update({"requests": requests})
+                _retry(lambda: spreadsheet.batch_update({"requests": requests}))
 
                 # ── Convert to native Google Sheets Table ──
                 table_name = f"Table{sync_dt.day}"
@@ -3472,7 +3490,6 @@ class TimexApp(App):
                 link_written = False
                 try:
                     link_url = f"https://docs.google.com/spreadsheets/d/{ssid}/edit#gid={sheet_id}&range=A{start_row}"
-                    link_dates = self._sync_link_dates
                     report_vals = report_ws.col_values(1)
                     report_id = report_ws.id
                     link_requests = []
@@ -3517,9 +3534,9 @@ class TimexApp(App):
 
                 n = len(task_entries)
                 total_fmt = self._fmt_time(total_secs)
-                if len(self._sync_link_dates) > 1:
-                    date_short = (self._sync_link_dates[0].strftime("%d.%m") + "\u2013" +
-                                  self._sync_link_dates[-1].strftime("%d.%m"))
+                if len(link_dates) > 1:
+                    date_short = (link_dates[0].strftime("%d.%m") + "\u2013" +
+                                  link_dates[-1].strftime("%d.%m"))
                 else:
                     date_short = sync_dt.strftime("%d.%m")
                 suffix = " + Report link" if link_written else ""
@@ -3536,6 +3553,8 @@ class TimexApp(App):
         elif action == "clear":
             self._toast("Clearing...", 10)
             sync_dt = self._sync_dt
+            clear_date_long = self._sync_date_long
+            clear_date_search = self._sync_date_search
 
             def _do_sync_clear():
                 ssid = self._get_sync_spreadsheet_id()
@@ -3557,14 +3576,12 @@ class TimexApp(App):
                     return
                 sheet_id = days_sheet.id
 
-                date_long = self._sync_date_long
-                date_search = self._sync_date_search
                 all_vals = days_sheet.get_all_values()
 
                 # Find existing table
-                search_terms = {date_long}
-                if date_search:
-                    search_terms.update(date_search)
+                search_terms = {clear_date_long}
+                if clear_date_search:
+                    search_terms.update(clear_date_search)
                 existing_row = None
                 for i, row in enumerate(all_vals):
                     if row and row[0] in search_terms:
@@ -3593,7 +3610,7 @@ class TimexApp(App):
 
                 clear_rows = old_end - title_row + 1
                 empty = [["", "", "", "", ""]] * clear_rows
-                days_sheet.update(f"A{title_row}", empty, value_input_option="RAW")
+                _retry(lambda: days_sheet.update(f"A{title_row}", empty, value_input_option="RAW"))
                 r0 = title_row - 1
                 r1 = r0 + clear_rows
                 spreadsheet.batch_update({"requests": [
@@ -3883,7 +3900,7 @@ class TimexApp(App):
         self._stop_watch()
         self._view_mode = "timeline"
         self._update_placeholder()
-        self._render_all()
+        self._mark_dirty()
         self._save_state()
         self._toast("Session saved — new day started")
 
@@ -3898,7 +3915,7 @@ class TimexApp(App):
         self.total_paused = timedelta()
         self._final_active = 0.0
         self._update_placeholder()
-        self._render_all()
+        self._mark_dirty()
         self._save_state()
         self._toast("Cleared")
 
@@ -3929,7 +3946,7 @@ class TimexApp(App):
         if m: parts_str.append(f"{m}m")
         if s: parts_str.append(f"{s}s")
         self._toast(f"Added {' '.join(parts_str)}")
-        self._render_all()
+        self._mark_dirty()
         self._save_state()
 
     def _cmd_remove_time(self, raw: str) -> None:
@@ -3957,7 +3974,7 @@ class TimexApp(App):
         if m: parts_str.append(f"{m}m")
         if s: parts_str.append(f"{s}s")
         self._toast(f"Removed {' '.join(parts_str)}")
-        self._render_all()
+        self._mark_dirty()
         self._save_state()
 
     def _cmd_help(self) -> None:
@@ -4785,18 +4802,10 @@ class TimexApp(App):
         # Group by date → total seconds
         by_date: dict[str, float] = defaultdict(float)
         sessions_by_date: dict[str, int] = defaultdict(int)
-        task_times: dict[str, float] = defaultdict(float)
-
         for session in history:
             d = session.get("date", "")
             by_date[d] += session.get("total_active", 0)
             sessions_by_date[d] += 1
-            for t in session.get("tasks", []):
-                start = t.get("active_start", 0) or 0
-                end = t.get("active_end") or t.get("active_start", 0) or 0
-                dur = max(0, end - start)
-                if dur > 0:
-                    task_times[t.get("name", "Untitled")] += dur
 
         # Compute 7-day and 30-day stats
         def _period_stats(days: int) -> tuple[float, float, int]:
@@ -5101,43 +5110,73 @@ class TimexApp(App):
         except OSError:
             pass
 
-    def _save_history(self) -> None:
-        """Append current session to history.json."""
+    def _build_history_entry(self) -> dict | None:
+        """Build history entry from current session WITHOUT modifying state."""
         if not self.tasks:
-            return
+            return None
+        active = self._active_seconds()
+        now = self._now()
+        # Finalize last task timestamps in-place
+        if self.tasks and self.tasks[-1].active_end is None:
+            self.tasks[-1].active_end = active
+            self.tasks[-1].wall_end = now
+        return {
+            "date": self.tasks[0].wall_start.strftime("%Y-%m-%d"),
+            "session_start": self.session_start.isoformat() if self.session_start else None,
+            "total_active": active,
+            "tasks": [self._serialize_task(t) for t in self.tasks],
+            "watch_used": self._watch_used,
+        }
+
+    def _append_history(self, entry: dict) -> None:
+        """Append a pre-built entry to history.json."""
         try:
-            # Finalize the last (current) task before saving
-            active = self._active_seconds()
-            now = self._now()
-            if self.tasks and self.tasks[-1].active_end is None:
-                self.tasks[-1].active_end = active
-                self.tasks[-1].wall_end = now
             history = self._load_history()
-            session = {
-                "date": self.tasks[0].wall_start.strftime("%Y-%m-%d"),
-                "session_start": self.session_start.isoformat() if self.session_start else None,
-                "total_active": active,
-                "tasks": [self._serialize_task(t) for t in self.tasks],
-                "watch_used": self._watch_used,
-            }
-            history.append(session)
+            history.append(entry)
             hf = self._history_file()
             hf.parent.mkdir(parents=True, exist_ok=True)
             tmp = hf.with_suffix(".tmp")
             tmp.write_text(json.dumps(history, indent=2))
             tmp.replace(hf)
+            self._invalidate_history_cache()
             self._reload_project_history_secs()
         except OSError:
             pass
 
+    def _save_history(self) -> None:
+        """Append current session to history.json."""
+        entry = self._build_history_entry()
+        if entry:
+            self._append_history(entry)
+        except OSError:
+            pass
+
+    _history_cache: list[dict] | None = None
+    _history_cache_mtime: float = 0.0
+    _history_cache_path: str = ""
+
     def _load_history(self) -> list[dict]:
         try:
             hf = self._history_file()
-            if hf.exists():
-                return json.loads(hf.read_text())
+            hf_str = str(hf)
+            if not hf.exists():
+                return []
+            mtime = hf.stat().st_mtime
+            if (self._history_cache is not None
+                    and mtime == self._history_cache_mtime
+                    and hf_str == self._history_cache_path):
+                return self._history_cache
+            data = json.loads(hf.read_text())
+            TimexApp._history_cache = data
+            TimexApp._history_cache_mtime = mtime
+            TimexApp._history_cache_path = hf_str
+            return data
         except (OSError, json.JSONDecodeError):
             pass
         return []
+
+    def _invalidate_history_cache(self) -> None:
+        TimexApp._history_cache = None
 
     def _reload_project_history_secs(self) -> None:
         """Cache total active seconds from project history."""
