@@ -414,8 +414,8 @@ class TimexApp(App):
     }
 
     #simple-btn-glow {
-        margin: 0 4 0 4;
         height: 1;
+        content-align: center middle;
         display: none;
     }
 
@@ -642,7 +642,7 @@ class TimexApp(App):
         btn = self.query_one("#simple-btn", Static)
         glow = self.query_one("#simple-btn-glow", Static)
         accent = self._accent
-        glow_color = self._blend_hex(accent, "#171717", 0.35)
+        glow_color = self._blend_hex(accent, "#171717", 0.55)
         if self.state == RUNNING:
             # Pause — semi-transparent bg + border
             btn.update(Text.from_markup(f"[bold {accent}]\u23f8[/]"))
@@ -658,7 +658,9 @@ class TimexApp(App):
             btn.update(Text.from_markup(f"[bold #171717]\u25b6[/]"))
             btn.styles.background = accent
             btn.styles.border = ("round", accent)
-        glow.styles.background = glow_color
+        # Glow: thin centered line of ▁ characters, no background
+        glow.update(Text.from_markup(f"[{glow_color}]\u2581\u2581\u2581\u2581\u2581\u2581\u2581\u2581\u2581\u2581\u2581\u2581\u2581\u2581\u2581\u2581\u2581\u2581\u2581\u2581\u2581\u2581\u2581\u2581[/]"))
+        glow.styles.background = "#171717"
 
     def on_key(self, event: Key) -> None:
         if self._ui_mode != "simple":
