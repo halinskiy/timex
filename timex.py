@@ -665,10 +665,13 @@ class TimexApp(App):
                         a = self._accent.lstrip("#")
                         r, g, b = int(a[0:2], 16), int(a[2:4], 16), int(a[4:6], 16)
                         btn.styles.background = f"#{int(r*0.75):02x}{int(g*0.75):02x}{int(b*0.75):02x}"
-                # Reset release timer on every key repeat
-                if self._btn_release_timer is not None:
-                    self._btn_release_timer.stop()
-                self._btn_release_timer = self.set_timer(0.15, self._on_btn_release)
+                    # First timer: 350ms (wait for key repeat to start)
+                    self._btn_release_timer = self.set_timer(0.35, self._on_btn_release)
+                else:
+                    # Key repeat arrived → user is holding. Short debounce.
+                    if self._btn_release_timer is not None:
+                        self._btn_release_timer.stop()
+                    self._btn_release_timer = self.set_timer(0.15, self._on_btn_release)
             elif event.key == "escape":
                 event.stop()
                 self._enter_unlock()
