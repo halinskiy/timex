@@ -636,7 +636,7 @@ class TimexApp(App):
             btn.update(Text.from_markup(f"[bold {accent}]\u275a\u275a[/]"))
             btn.styles.background = "#1e1e1e"
         elif self.state == PAUSED:
-            btn.update(Text.from_markup(f"[bold #171717]\u25b6\u275a[/]"))
+            btn.update(Text.from_markup(f"[bold #171717]\u25ba\u275a[/]"))
             btn.styles.background = accent
         else:
             btn.update(Text.from_markup(f"[bold #171717]\u25b6\ufe0e[/]"))
