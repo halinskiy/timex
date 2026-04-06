@@ -639,7 +639,7 @@ class TimexApp(App):
             btn.update(Text.from_markup(f"[bold #171717]\u276f\u275a[/]"))
             btn.styles.background = accent
         else:
-            btn.update(Text.from_markup(f"[bold #171717]\u276f[/]"))
+            btn.update(Text.from_markup(f"[bold #171717]\u25b6\ufe0e[/]"))
             btn.styles.background = accent
 
     def on_key(self, event: Key) -> None:
