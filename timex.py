@@ -408,10 +408,14 @@ class TimexApp(App):
     #simple-btn {
         margin: 0 2 0 2;
         height: 3;
-        background: #e8a55d;
-        color: #171717;
         content-align: center middle;
         text-style: bold;
+        display: none;
+    }
+
+    #simple-btn-glow {
+        margin: 0 4 0 4;
+        height: 1;
         display: none;
     }
 
@@ -558,6 +562,7 @@ class TimexApp(App):
         yield Static(id="toast-bar")
         yield HistoryInput(app_ref=self, placeholder="  What are you working on?  (/start to begin)", id="task-input")
         yield Static(id="simple-btn")
+        yield Static(id="simple-btn-glow")
         yield Static(id="footer-bar")
 
     # ── Project paths ──────────────────────────────────────────────────
@@ -607,25 +612,53 @@ class TimexApp(App):
     def _apply_mode(self) -> None:
         inp = self.query_one("#task-input", HistoryInput)
         btn = self.query_one("#simple-btn", Static)
+        glow = self.query_one("#simple-btn-glow", Static)
         if self._ui_mode == "simple":
             inp.display = False
             btn.display = True
+            glow.display = True
             self._update_simple_btn()
         else:
             btn.display = False
+            glow.display = False
             inp.display = True
             inp.focus()
 
+    @staticmethod
+    def _blend_hex(fg: str, bg: str = "#171717", alpha: float = 0.1) -> str:
+        """Blend fg over bg at given alpha; return hex string."""
+        def p(h):
+            h = h.lstrip("#")
+            return int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16)
+        r1, g1, b1 = p(fg)
+        r0, g0, b0 = p(bg)
+        return "#{:02x}{:02x}{:02x}".format(
+            int(r0 + alpha * (r1 - r0)),
+            int(g0 + alpha * (g1 - g0)),
+            int(b0 + alpha * (b1 - b0)),
+        )
+
     def _update_simple_btn(self) -> None:
-        if self.state == RUNNING:
-            label = "\u23f8   Pause"
-        elif self.state == PAUSED:
-            label = "\u25b6   Resume"
-        else:
-            label = "\u25b6   Start"
         btn = self.query_one("#simple-btn", Static)
-        btn.update(Text.from_markup(f"[bold #171717]{label}[/]"))
-        btn.styles.background = self._accent
+        glow = self.query_one("#simple-btn-glow", Static)
+        accent = self._accent
+        glow_color = self._blend_hex(accent, "#171717", 0.35)
+        if self.state == RUNNING:
+            # Pause — semi-transparent bg + border
+            btn.update(Text.from_markup(f"[bold {accent}]\u23f8[/]"))
+            btn.styles.background = self._blend_hex(accent, "#171717", 0.10)
+            btn.styles.border = ("round", accent)
+        elif self.state == PAUSED:
+            # Resume — semi-transparent bg + border
+            btn.update(Text.from_markup(f"[bold {accent}]\u25b6[/]"))
+            btn.styles.background = self._blend_hex(accent, "#171717", 0.10)
+            btn.styles.border = ("round", accent)
+        else:
+            # Start — filled accent
+            btn.update(Text.from_markup(f"[bold #171717]\u25b6[/]"))
+            btn.styles.background = accent
+            btn.styles.border = ("round", accent)
+        glow.styles.background = glow_color
 
     def on_key(self, event: Key) -> None:
         if self._ui_mode != "simple":
@@ -650,6 +683,7 @@ class TimexApp(App):
         inp = self.query_one("#task-input", HistoryInput)
         inp.display = True
         self.query_one("#simple-btn", Static).display = False
+        self.query_one("#simple-btn-glow", Static).display = False
         self._enter_view("mode", "  1 or 2 \u2022 /back to cancel")
         inp.focus()
 
