@@ -279,6 +279,26 @@ class HistoryInput(Input):
                 app._project_edit_start_rename()
                 return True
 
+        # Session edit navigation
+        if app and getattr(app, "_view_mode", "") == "edit_sessions" and getattr(app, "_editing_session", None) is None:
+            if event.key == "up":
+                event.prevent_default()
+                event.stop()
+                app._session_edit_index = max(0, app._session_edit_index - 1)
+                app._render_edit_sessions()
+                return True
+            elif event.key == "down":
+                event.prevent_default()
+                event.stop()
+                app._session_edit_index = min(len(app._viewing_sessions) - 1, app._session_edit_index + 1)
+                app._render_edit_sessions()
+                return True
+            elif event.key == "enter" and not self.value.strip():
+                event.prevent_default()
+                event.stop()
+                app._select_edit_sessions("")
+                return True
+
         # Edit mode navigation: Up/Down move cursor, Enter starts rename
         if app and getattr(app, "_view_mode", "") == "edit" and getattr(app, "_editing_task", None) is None:
             if event.key == "up":
@@ -520,6 +540,9 @@ class TimexApp(App):
         self._confirm_sheets_ctx: dict = {}  # context for confirm_create_sheets view
         self._ui_mode: str = "cli"  # "cli" or "simple"
         self._btn_pressing: bool = False
+        self._viewing_sessions: list[dict] = []
+        self._session_edit_index: int = 0
+        self._editing_session: int | None = None
         self._project_edit_index: int = 0  # selected project in project_edit
         self._project_editing: int | None = None  # index of project being renamed
         self._project_to_delete: str | None = None  # project name pending deletion
@@ -998,6 +1021,14 @@ class TimexApp(App):
             scroll.border_title = "History"
             self._render_dates_list()
             return
+        if self._view_mode == "date_sessions":
+            scroll.border_title = self._viewing_date
+            self._render_date_sessions()
+            return
+        if self._view_mode == "edit_sessions":
+            scroll.border_title = self._viewing_date
+            self._render_edit_sessions()
+            return
         if self._view_mode == "history_detail":
             scroll.border_title = self._viewing_date
             self._render_tasks(self._viewing_tasks, is_live=False)
@@ -1120,6 +1151,146 @@ class TimexApp(App):
         ))
 
         self.query_one("#history", Static).update(Group(*rows))
+
+    def _render_date_sessions(self) -> None:
+        rows = []
+        sessions = self._viewing_sessions
+        for i, s in enumerate(sessions):
+            if i > 0:
+                rows.append(Text.from_markup(f"[{SEPARATOR}]{'─' * 50}[/]"))
+            total = s.get("total_active", 0)
+            tasks = s.get("tasks", [])
+            n = len(tasks)
+            label = s.get("label", f"Session {i + 1}")
+            # Time range from wall_start of first task → wall_end of last task
+            t_start = ""
+            t_end = ""
+            if tasks:
+                try:
+                    t_start = datetime.fromisoformat(tasks[0].get("wall_start", "")).strftime("%H:%M")
+                except (ValueError, AttributeError):
+                    pass
+                try:
+                    last = tasks[-1]
+                    ws = last.get("wall_end") or last.get("wall_start", "")
+                    t_end = datetime.fromisoformat(ws).strftime("%H:%M")
+                except (ValueError, AttributeError):
+                    pass
+            time_range = f"{t_start}\u2013{t_end}" if t_start and t_end else ""
+            rows.append(self._space_between(
+                f"[bold {self._accent}]{i + 1}.[/] [{TEXT_COLOR}]{label}[/]",
+                f"[{self._accent}]{self._fmt_time(total)}[/]",
+            ))
+            rows.append(Text.from_markup(
+                f"   [{DIM}]{time_range}  \u2022  {n} task{'s' if n != 1 else ''}[/]"
+            ))
+        self.query_one("#history", Static).update(Group(*rows))
+
+    def _select_date_sessions(self, raw: str) -> None:
+        if not raw.isdigit():
+            return
+        num = int(raw)
+        if num < 1 or num > len(self._viewing_sessions):
+            self._toast(f"Enter 1\u2013{len(self._viewing_sessions)}")
+            return
+        session = self._viewing_sessions[num - 1]
+        tasks = [self._deserialize_task(td) for td in session.get("tasks", [])]
+        if not tasks:
+            self._toast("No tasks in this session")
+            return
+        self._view_mode = "history_detail"
+        self._viewing_tasks = tasks
+        self._viewing_session_idx = num - 1
+        self._render_history()
+        inp = self.query_one("#task-input", HistoryInput)
+        inp.placeholder = "  /edit to manage \u2022 /back to sessions"
+
+    # ── Session edit (rename/delete from history) ────────────────────────
+
+    def _cmd_edit_sessions(self) -> None:
+        if not self._viewing_sessions:
+            self._toast("No sessions to edit")
+            return
+        self._view_mode = "edit_sessions"
+        self._session_edit_index = 0
+        self._editing_session = None
+        self._render_history()
+        inp = self.query_one("#task-input", HistoryInput)
+        inp.placeholder = "  \u2191/\u2193 to select \u2022 Enter to rename \u2022 /back"
+
+    def _render_edit_sessions(self) -> None:
+        rows = []
+        sessions = self._viewing_sessions
+        for i, s in enumerate(sessions):
+            if i > 0:
+                rows.append(Text.from_markup(f"[{SEPARATOR}]{'─' * 50}[/]"))
+            total = s.get("total_active", 0)
+            n = len(s.get("tasks", []))
+            label = s.get("label", f"Session {i + 1}")
+            selected = (i == self._session_edit_index)
+            if selected:
+                rows.append(Text.from_markup(
+                    f"[bold {self._accent}]\u25b6 {label}[/]  [{DIM}]{self._fmt_time(total)} \u2022 {n} tasks[/]"
+                ))
+            else:
+                rows.append(Text.from_markup(
+                    f"  [{TEXT_COLOR}]{label}[/]  [{DIM}]{self._fmt_time(total)} \u2022 {n} tasks[/]"
+                ))
+        rows.append(Text(""))
+        rows.append(Text.from_markup(f"  [{DIM}]Enter to rename \u2022 empty to delete \u2022 /back[/]"))
+        self.query_one("#history", Static).update(Group(*rows))
+
+    def _select_edit_sessions(self, raw: str) -> None:
+        if self._editing_session is not None:
+            # Submitting rename or delete
+            idx = self._editing_session
+            if idx >= len(self._viewing_sessions):
+                self._editing_session = None
+                return
+            if raw:
+                # Rename: set label
+                self._viewing_sessions[idx]["label"] = raw
+                self._save_sessions_to_history()
+                self._toast("Session renamed")
+            else:
+                # Delete session
+                self._viewing_sessions.pop(idx)
+                self._save_sessions_to_history()
+                self._toast("Session deleted")
+                if not self._viewing_sessions:
+                    self._leave_view("All sessions deleted")
+                    return
+                self._session_edit_index = min(self._session_edit_index, len(self._viewing_sessions) - 1)
+            self._editing_session = None
+            self._render_edit_sessions()
+            inp = self.query_one("#task-input", HistoryInput)
+            inp.placeholder = "  \u2191/\u2193 to select \u2022 Enter to rename \u2022 /back"
+            return
+
+        # Enter on selected → start rename
+        idx = self._session_edit_index
+        self._editing_session = idx
+        label = self._viewing_sessions[idx].get("label", f"Session {idx + 1}")
+        inp = self.query_one("#task-input", HistoryInput)
+        inp.value = label
+        inp.placeholder = "  New name (empty to delete) \u2022 Enter to confirm"
+
+    def _save_sessions_to_history(self) -> None:
+        """Rewrite history.json with updated/deleted sessions for the viewed date."""
+        history = self._load_history()
+        date_str = self._viewing_date_str
+        # Remove all sessions for this date
+        history = [s for s in history if s.get("date") != date_str]
+        # Re-add the remaining (possibly modified) sessions
+        history.extend(self._viewing_sessions)
+        # Sort by date + session_start
+        history.sort(key=lambda s: (s.get("date", ""), s.get("session_start", "")))
+        hf = self._history_file()
+        hf.parent.mkdir(parents=True, exist_ok=True)
+        tmp = hf.with_suffix(".tmp")
+        tmp.write_text(json.dumps(history, indent=2))
+        tmp.replace(hf)
+        self._invalidate_history_cache()
 
     # Smooth gradient keyframes for update border
     _GRADIENT_KEYS = [
@@ -1295,6 +1466,10 @@ class TimexApp(App):
             self._submit_edit(raw)
         elif self._view_mode == "dates" and raw.isdigit():
             self._select_date(int(raw))
+        elif self._view_mode == "date_sessions":
+            self._select_date_sessions(raw)
+        elif self._view_mode == "edit_sessions":
+            self._select_edit_sessions(raw)
         elif self._view_mode == "timezone":
             self._select_timezone(raw)
         elif self._view_mode == "notification":
@@ -4017,6 +4192,9 @@ class TimexApp(App):
         return self.tasks if self.tasks else self._last_session_tasks
 
     def _cmd_edit(self) -> None:
+        if self._view_mode == "date_sessions":
+            self._cmd_edit_sessions()
+            return
         if self._view_mode == "project":
             self._cmd_project_edit()
             return
@@ -4750,12 +4928,32 @@ class TimexApp(App):
 
     def _cmd_back(self) -> None:
         if self._view_mode == "history_detail":
+            if self._viewing_sessions:
+                # Back to session list
+                self._view_mode = "date_sessions"
+                self._viewing_tasks = []
+                self._render_history()
+                inp = self.query_one("#task-input", HistoryInput)
+                inp.placeholder = "  Enter number \u2022 /edit to manage \u2022 /back"
+            else:
+                self._view_mode = "dates"
+                self._viewing_tasks = []
+                self._viewing_date = ""
+                self._render_history()
+                inp = self.query_one("#task-input", HistoryInput)
+                inp.placeholder = "  Enter number to view date \u2022 /back to return"
+        elif self._view_mode == "date_sessions":
+            self._viewing_sessions = []
             self._view_mode = "dates"
-            self._viewing_tasks = []
-            self._viewing_date = ""
             self._render_history()
             inp = self.query_one("#task-input", HistoryInput)
             inp.placeholder = "  Enter number to view date \u2022 /back to return"
+        elif self._view_mode == "edit_sessions":
+            self._editing_session = None
+            self._view_mode = "date_sessions"
+            self._render_history()
+            inp = self.query_one("#task-input", HistoryInput)
+            inp.placeholder = "  Enter number \u2022 /edit to manage \u2022 /back"
         elif self._view_mode == "confirm_delete_project":
             self._project_to_delete = None
             self._enter_view("project_edit", "  ↑/↓ to select • Enter to rename • /back")
@@ -4776,14 +4974,9 @@ class TimexApp(App):
         date_str = self._dates_list[num - 1]
         history = self._load_history()
 
-        tasks = []
-        for session in history:
-            if session.get("date") == date_str:
-                for td in session.get("tasks", []):
-                    tasks.append(self._deserialize_task(td))
-
-        if not tasks:
-            self._toast("No tasks for this date")
+        sessions = [s for s in history if s.get("date") == date_str]
+        if not sessions:
+            self._toast("No data for this date")
             return
 
         try:
@@ -4792,16 +4985,29 @@ class TimexApp(App):
         except ValueError:
             nice_date = date_str
 
-        self._view_mode = "history_detail"
-        self._viewing_tasks = tasks
-        self._viewing_date = nice_date
-        self._viewing_date_str = date_str
-        self._render_history()
-        inp = self.query_one("#task-input", HistoryInput)
-        if self.state == IDLE:
-            inp.placeholder = "  /resume to continue \u2022 /export to save \u2022 /back"
+        if len(sessions) == 1:
+            # Single session → go straight to tasks
+            tasks = [self._deserialize_task(td) for td in sessions[0].get("tasks", [])]
+            if not tasks:
+                self._toast("No tasks for this date")
+                return
+            self._view_mode = "history_detail"
+            self._viewing_tasks = tasks
+            self._viewing_date = nice_date
+            self._viewing_date_str = date_str
+            self._viewing_session_idx = 0
+            self._render_history()
+            inp = self.query_one("#task-input", HistoryInput)
+            inp.placeholder = "  /edit to manage \u2022 /back to return"
         else:
-            inp.placeholder = "  /export to save \u2022 /back to return"
+            # Multiple sessions → show session list
+            self._viewing_sessions = sessions
+            self._viewing_date = nice_date
+            self._viewing_date_str = date_str
+            self._view_mode = "date_sessions"
+            self._render_history()
+            inp = self.query_one("#task-input", HistoryInput)
+            inp.placeholder = "  Enter number \u2022 /edit to manage \u2022 /back"
 
     # ── Helpers ──────────────────────────────────────────────────────────
 
