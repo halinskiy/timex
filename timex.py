@@ -632,13 +632,13 @@ class TimexApp(App):
         btn = self.query_one("#simple-btn", Static)
         accent = self._accent
         if self.state == RUNNING:
-            btn.update(Text.from_markup(f"[bold {accent}]\u23f8[/]"))
+            btn.update(Text.from_markup(f"[bold {accent}]\u23f8\ufe0e[/]"))
             btn.styles.background = "#1e1e1e"
         elif self.state == PAUSED:
-            btn.update(Text.from_markup(f"[bold {accent}]\u23ef[/]"))
+            btn.update(Text.from_markup(f"[bold {accent}]\u23ef\ufe0e[/]"))
             btn.styles.background = "#1e1e1e"
         else:
-            btn.update(Text.from_markup(f"[bold #171717]\u25b6[/]"))
+            btn.update(Text.from_markup(f"[bold #171717]\u25b6\ufe0e[/]"))
             btn.styles.background = accent
 
     def on_key(self, event: Key) -> None:
