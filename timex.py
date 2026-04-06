@@ -519,6 +519,8 @@ class TimexApp(App):
         self._export_connecting: bool = False  # waiting for spreadsheet URL paste
         self._confirm_sheets_ctx: dict = {}  # context for confirm_create_sheets view
         self._ui_mode: str = "cli"  # "cli" or "simple"
+        self._btn_pressed: bool = False
+        self._btn_release_timer = None
         self._project_edit_index: int = 0  # selected project in project_edit
         self._project_editing: int | None = None  # index of project being renamed
         self._project_to_delete: str | None = None  # project name pending deletion
@@ -648,22 +650,28 @@ class TimexApp(App):
         if self._view_mode == "timeline":
             if event.key in ("enter", "space"):
                 event.stop()
-                # Press effect: darken filled / lighten dark bg
-                btn = self.query_one("#simple-btn", Static)
-                if self.state == RUNNING:
-                    btn.styles.background = "#2a2a2a"  # lighten dark bg
-                else:
-                    # Darken filled accent by blending toward black
-                    a = self._accent.lstrip("#")
-                    r, g, b = int(a[0:2], 16), int(a[2:4], 16), int(a[4:6], 16)
-                    btn.styles.background = f"#{int(r*0.75):02x}{int(g*0.75):02x}{int(b*0.75):02x}"
-                self.set_timer(0.1, self._on_btn_release)
+                # Show pressed state on first press
+                if not self._btn_pressed:
+                    self._btn_pressed = True
+                    btn = self.query_one("#simple-btn", Static)
+                    if self.state == RUNNING:
+                        btn.styles.background = "#2a2a2a"
+                    else:
+                        a = self._accent.lstrip("#")
+                        r, g, b = int(a[0:2], 16), int(a[2:4], 16), int(a[4:6], 16)
+                        btn.styles.background = f"#{int(r*0.75):02x}{int(g*0.75):02x}{int(b*0.75):02x}"
+                # Debounce: reset timer on every key repeat
+                if self._btn_release_timer is not None:
+                    self._btn_release_timer.stop()
+                self._btn_release_timer = self.set_timer(0.15, self._on_btn_release)
             elif event.key == "escape":
                 event.stop()
                 self._enter_unlock()
 
     def _on_btn_release(self) -> None:
-        """Execute action and restore button after press effect."""
+        """Key repeats stopped → user released. Execute action."""
+        self._btn_pressed = False
+        self._btn_release_timer = None
         if self.state == IDLE:
             self._cmd_start()
         elif self.state == RUNNING:
