@@ -5148,8 +5148,6 @@ class TimexApp(App):
         entry = self._build_history_entry()
         if entry:
             self._append_history(entry)
-        except OSError:
-            pass
 
     _history_cache: list[dict] | None = None
     _history_cache_mtime: float = 0.0
