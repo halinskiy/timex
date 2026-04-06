@@ -520,6 +520,8 @@ class TimexApp(App):
         self._confirm_sheets_ctx: dict = {}  # context for confirm_create_sheets view
         self._ui_mode: str = "cli"  # "cli" or "simple"
         self._btn_pressed: bool = False
+        self._btn_cooldown: bool = False
+        self._btn_action: str | None = None
         self._btn_release_timer = None
         self._project_edit_index: int = 0  # selected project in project_edit
         self._project_editing: int | None = None  # index of project being renamed
@@ -650,9 +652,12 @@ class TimexApp(App):
         if self._view_mode == "timeline":
             if event.key in ("enter", "space"):
                 event.stop()
-                # Show pressed state on first press
+                if self._btn_cooldown:
+                    return  # ignore during post-action cooldown
                 if not self._btn_pressed:
+                    # First press — capture action, show pressed visual
                     self._btn_pressed = True
+                    self._btn_action = self.state
                     btn = self.query_one("#simple-btn", Static)
                     if self.state == RUNNING:
                         btn.styles.background = "#2a2a2a"
@@ -660,7 +665,7 @@ class TimexApp(App):
                         a = self._accent.lstrip("#")
                         r, g, b = int(a[0:2], 16), int(a[2:4], 16), int(a[4:6], 16)
                         btn.styles.background = f"#{int(r*0.75):02x}{int(g*0.75):02x}{int(b*0.75):02x}"
-                # Debounce: reset timer on every key repeat
+                # Reset release timer on every key repeat
                 if self._btn_release_timer is not None:
                     self._btn_release_timer.stop()
                 self._btn_release_timer = self.set_timer(0.15, self._on_btn_release)
@@ -669,15 +674,23 @@ class TimexApp(App):
                 self._enter_unlock()
 
     def _on_btn_release(self) -> None:
-        """Key repeats stopped → user released. Execute action."""
-        self._btn_pressed = False
+        """Key repeats stopped → user released. Fire captured action."""
         self._btn_release_timer = None
-        if self.state == IDLE:
+        action = self._btn_action
+        self._btn_action = None
+        if action == IDLE:
             self._cmd_start()
-        elif self.state == RUNNING:
+        elif action == RUNNING:
             self._cmd_pause()
-        elif self.state == PAUSED:
+        elif action == PAUSED:
             self._cmd_resume()
+        # Cooldown: ignore keys for 300ms to prevent re-trigger
+        self._btn_cooldown = True
+        self.set_timer(0.3, self._on_btn_cooldown)
+
+    def _on_btn_cooldown(self) -> None:
+        self._btn_pressed = False
+        self._btn_cooldown = False
 
     # ── /lock ─────────────────────────────────────────────────────────────
 
