@@ -3651,6 +3651,8 @@ class TimexApp(App):
         if self.state == IDLE:
             self._toast("Nothing to save")
             return
+        n_tasks = len(self.tasks)
+        active = self._active_seconds()
         self._save_history()
         self._project_history_loaded = False
         self.state = IDLE
@@ -3669,7 +3671,7 @@ class TimexApp(App):
         self._update_placeholder()
         self._mark_dirty()
         self._save_state()
-        self._toast("Session saved — new day started")
+        self._toast(f"Saved {n_tasks} tasks, {self._fmt_time(active)}")
 
     def _cmd_clear(self) -> None:
         if self._watch_mode is not None:
