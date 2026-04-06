@@ -1168,7 +1168,7 @@ class TimexApp(App):
 
     def _render_footer(self) -> None:
         if self._ui_mode == "simple":
-            footer = Text.from_markup(f"  [{DIM}]Esc \u00b7 unlock[/]")
+            footer = Text.from_markup(f"  [{DIM}]Esc \u00b7 unlock  \u2502  Space \u00b7 continue[/]")
             footer.justify = "center"
             self.query_one("#footer-bar", Static).update(footer)
             return
