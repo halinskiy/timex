@@ -413,12 +413,6 @@ class TimexApp(App):
         display: none;
     }
 
-    #simple-btn-glow {
-        height: 1;
-        content-align: center middle;
-        display: none;
-    }
-
     #toast-bar {
         height: auto;
         margin: 0 2 0 2;
@@ -562,7 +556,6 @@ class TimexApp(App):
         yield Static(id="toast-bar")
         yield HistoryInput(app_ref=self, placeholder="  What are you working on?  (/start to begin)", id="task-input")
         yield Static(id="simple-btn")
-        yield Static(id="simple-btn-glow")
         yield Static(id="footer-bar")
 
     # ── Project paths ──────────────────────────────────────────────────
@@ -612,15 +605,12 @@ class TimexApp(App):
     def _apply_mode(self) -> None:
         inp = self.query_one("#task-input", HistoryInput)
         btn = self.query_one("#simple-btn", Static)
-        glow = self.query_one("#simple-btn-glow", Static)
         if self._ui_mode == "simple":
             inp.display = False
             btn.display = True
-            glow.display = True
             self._update_simple_btn()
         else:
             btn.display = False
-            glow.display = False
             inp.display = True
             inp.focus()
 
@@ -640,20 +630,16 @@ class TimexApp(App):
 
     def _update_simple_btn(self) -> None:
         btn = self.query_one("#simple-btn", Static)
-        glow = self.query_one("#simple-btn-glow", Static)
         accent = self._accent
         if self.state == RUNNING:
             btn.update(Text.from_markup(f"[bold {accent}]\u23f8[/]"))
             btn.styles.background = "#1e1e1e"
         elif self.state == PAUSED:
-            btn.update(Text.from_markup(f"[bold {accent}]\u25b6[/]"))
+            btn.update(Text.from_markup(f"[bold {accent}]\u23ef[/]"))
             btn.styles.background = "#1e1e1e"
         else:
             btn.update(Text.from_markup(f"[bold #171717]\u25b6[/]"))
             btn.styles.background = accent
-        glow_color = self._blend_hex(accent, "#171717", 0.55)
-        glow.update(Text.from_markup(f"[{glow_color}]\u2581\u2581\u2581\u2581\u2581\u2581\u2581\u2581\u2581\u2581\u2581\u2581\u2581\u2581\u2581\u2581\u2581\u2581\u2581\u2581\u2581\u2581\u2581\u2581[/]"))
-        glow.styles.background = "#171717"
 
     def on_key(self, event: Key) -> None:
         if self._ui_mode != "simple":
@@ -678,7 +664,6 @@ class TimexApp(App):
         inp = self.query_one("#task-input", HistoryInput)
         inp.display = True
         self.query_one("#simple-btn", Static).display = False
-        self.query_one("#simple-btn-glow", Static).display = False
         self._enter_view("mode", "  1 or 2 \u2022 /back to cancel")
         inp.focus()
 
