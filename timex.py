@@ -648,53 +648,52 @@ class TimexApp(App):
         if self._view_mode == "timeline":
             if event.key in ("enter", "space"):
                 event.stop()
-                if self.state == IDLE:
-                    self._cmd_start()
-                elif self.state == RUNNING:
-                    self._cmd_pause()
-                elif self.state == PAUSED:
-                    self._cmd_resume()
+                # Press effect: darken filled / lighten dark bg
+                btn = self.query_one("#simple-btn", Static)
+                if self.state == RUNNING:
+                    btn.styles.background = "#2a2a2a"  # lighten dark bg
+                else:
+                    # Darken filled accent by blending toward black
+                    a = self._accent.lstrip("#")
+                    r, g, b = int(a[0:2], 16), int(a[2:4], 16), int(a[4:6], 16)
+                    btn.styles.background = f"#{int(r*0.75):02x}{int(g*0.75):02x}{int(b*0.75):02x}"
+                self.set_timer(0.1, self._on_btn_release)
             elif event.key == "escape":
                 event.stop()
                 self._enter_unlock()
 
+    def _on_btn_release(self) -> None:
+        """Execute action and restore button after press effect."""
+        if self.state == IDLE:
+            self._cmd_start()
+        elif self.state == RUNNING:
+            self._cmd_pause()
+        elif self.state == PAUSED:
+            self._cmd_resume()
+
     # ── /lock ─────────────────────────────────────────────────────────────
 
     def _cmd_lock(self) -> None:
-        """Lock: fade input out, fade button in."""
+        """Lock: instantly switch input → button."""
         if self._ui_mode == "simple":
             return
         inp = self.query_one("#task-input", HistoryInput)
-        inp.styles.animate("opacity", 0.0, duration=0.15, on_complete=self._finish_lock)
-
-    def _finish_lock(self) -> None:
-        inp = self.query_one("#task-input", HistoryInput)
         btn = self.query_one("#simple-btn", Static)
         inp.display = False
-        inp.styles.opacity = 1.0
         self._ui_mode = "simple"
         self._save_config("ui_mode", "simple")
-        btn.styles.opacity = 0.0
         btn.display = True
         self._update_simple_btn()
-        btn.styles.animate("opacity", 1.0, duration=0.15)
         self._render_footer()
 
     def _enter_unlock(self) -> None:
-        """Unlock: fade button out, fade input in."""
-        btn = self.query_one("#simple-btn", Static)
-        btn.styles.animate("opacity", 0.0, duration=0.15, on_complete=self._finish_unlock)
-
-    def _finish_unlock(self) -> None:
+        """Unlock: instantly switch button → input."""
         btn = self.query_one("#simple-btn", Static)
         inp = self.query_one("#task-input", HistoryInput)
         btn.display = False
-        btn.styles.opacity = 1.0
         self._ui_mode = "cli"
         self._save_config("ui_mode", "cli")
-        inp.styles.opacity = 0.0
         inp.display = True
-        inp.styles.animate("opacity", 1.0, duration=0.15)
         inp.focus()
         self._render_footer()
 
