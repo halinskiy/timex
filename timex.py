@@ -164,9 +164,9 @@ class TaskEntry:
 # ── Command suggestions ──────────────────────────────────────────────────────
 
 STATE_COMMANDS: dict[str, list[str]] = {
-    IDLE:    ["/start", "/new", "/date", "/stats", "/export", "/edit", "/clear", "/help", "/timezone", "/notification", "/color", "/project", "/mode", "/update", "/reload"],
-    RUNNING: ["/pause", "/add", "/remove", "/sleep", "/watch", "/reset", "/new", "/clear", "/date", "/stats", "/export", "/edit", "/help", "/timezone", "/notification", "/color", "/project", "/mode", "/update", "/reload"],
-    PAUSED:  ["/resume", "/watch", "/reset", "/new", "/clear", "/date", "/stats", "/export", "/edit", "/help", "/timezone", "/notification", "/color", "/project", "/mode", "/update", "/reload"],
+    IDLE:    ["/start", "/new", "/date", "/stats", "/export", "/edit", "/clear", "/help", "/timezone", "/notification", "/color", "/project", "/lock", "/update", "/reload"],
+    RUNNING: ["/pause", "/add", "/remove", "/sleep", "/watch", "/reset", "/new", "/clear", "/date", "/stats", "/export", "/edit", "/help", "/timezone", "/notification", "/color", "/project", "/lock", "/update", "/reload"],
+    PAUSED:  ["/resume", "/watch", "/reset", "/new", "/clear", "/date", "/stats", "/export", "/edit", "/help", "/timezone", "/notification", "/color", "/project", "/lock", "/update", "/reload"],
 }
 
 
@@ -655,39 +655,47 @@ class TimexApp(App):
                     self._cmd_resume()
             elif event.key == "escape":
                 event.stop()
-                self._cmd_mode()
+                self._enter_unlock()
 
-    # ── /mode ─────────────────────────────────────────────────────────────
+    # ── /lock ─────────────────────────────────────────────────────────────
 
-    def _cmd_mode(self) -> None:
-        # Ensure input is visible so user can type 1 or 2
-        inp = self.query_one("#task-input", HistoryInput)
-        inp.display = True
-        self.query_one("#simple-btn", Static).display = False
-        self._enter_view("mode", "  1 or 2 \u2022 /back to cancel")
-        inp.focus()
-
-    def _render_mode(self) -> None:
-        cli_dot = f"[bold {self._accent}]\u25cf[/]" if self._ui_mode == "cli" else f"[{DIM}]\u25cb[/]"
-        simple_dot = f"[bold {self._accent}]\u25cf[/]" if self._ui_mode == "simple" else f"[{DIM}]\u25cb[/]"
-        rows = [
-            Text(""),
-            Text.from_markup(f"[bold {self._accent}]1.[/]  {cli_dot}  [{TEXT_COLOR}]CLI[/]"),
-            Text.from_markup(f"     [{DIM}]Full command line with all features[/]"),
-            Text(""),
-            Text.from_markup(f"[bold {self._accent}]2.[/]  {simple_dot}  [{TEXT_COLOR}]Simple[/]"),
-            Text.from_markup(f"     [{DIM}]One big button — Start / Pause / Resume[/]"),
-            Text.from_markup(f"     [{DIM}]Enter or Space to activate[/]"),
-            Text.from_markup(f"     [{DIM}]Esc to access settings[/]"),
-        ]
-        self.query_one("#history", Static).update(Group(*rows))
-
-    def _select_mode(self, raw: str) -> None:
-        if raw not in ("1", "2"):
+    def _cmd_lock(self) -> None:
+        """Lock: fade input out, fade button in."""
+        if self._ui_mode == "simple":
             return
-        self._ui_mode = "cli" if raw == "1" else "simple"
-        self._save_config("ui_mode", self._ui_mode)
-        self._leave_view()
+        inp = self.query_one("#task-input", HistoryInput)
+        inp.animate("opacity", 0.0, duration=0.15, on_complete=self._finish_lock)
+
+    def _finish_lock(self) -> None:
+        inp = self.query_one("#task-input", HistoryInput)
+        btn = self.query_one("#simple-btn", Static)
+        inp.display = False
+        inp.styles.opacity = 1.0
+        self._ui_mode = "simple"
+        self._save_config("ui_mode", "simple")
+        btn.styles.opacity = 0.0
+        btn.display = True
+        self._update_simple_btn()
+        btn.animate("opacity", 1.0, duration=0.15)
+        self._render_footer()
+
+    def _enter_unlock(self) -> None:
+        """Unlock: fade button out, fade input in."""
+        btn = self.query_one("#simple-btn", Static)
+        btn.animate("opacity", 0.0, duration=0.15, on_complete=self._finish_unlock)
+
+    def _finish_unlock(self) -> None:
+        btn = self.query_one("#simple-btn", Static)
+        inp = self.query_one("#task-input", HistoryInput)
+        btn.display = False
+        btn.styles.opacity = 1.0
+        self._ui_mode = "cli"
+        self._save_config("ui_mode", "cli")
+        inp.styles.opacity = 0.0
+        inp.display = True
+        inp.animate("opacity", 1.0, duration=0.15)
+        inp.focus()
+        self._render_footer()
 
     # ── Timezone ──────────────────────────────────────────────────────────
 
@@ -965,10 +973,6 @@ class TimexApp(App):
             scroll.border_title = "Create Sheets"
             self._render_confirm_create_sheets()
             return
-        if self._view_mode == "mode":
-            scroll.border_title = "Display Mode"
-            self._render_mode()
-            return
         if self._view_mode == "dates":
             scroll.border_title = "History"
             self._render_dates_list()
@@ -1149,6 +1153,11 @@ class TimexApp(App):
         return f"#{r:02x}{g:02x}{b:02x}"
 
     def _render_footer(self) -> None:
+        if self._ui_mode == "simple":
+            footer = Text.from_markup(f"  [{DIM}]Esc \u00b7 unlock[/]")
+            footer.justify = "center"
+            self.query_one("#footer-bar", Static).update(footer)
+            return
         # Animate input border: accent ↔ blue based on waiting state
         waiting = self._is_input_waiting()
         step = 0.15  # per tick (0.5s) → ~3s full transition
@@ -1257,8 +1266,8 @@ class TimexApp(App):
             self._cmd_reload()
         elif cmd == "/update":
             self._cmd_update()
-        elif cmd == "/mode":
-            self._cmd_mode()
+        elif cmd == "/lock":
+            self._cmd_lock()
         elif cmd == "/project":
             self._cmd_project()
         elif cmd == "/watch":
@@ -1283,8 +1292,6 @@ class TimexApp(App):
             self._select_confirm_reset(raw)
         elif self._view_mode == "confirm_create_sheets":
             self._select_confirm_create_sheets(raw)
-        elif self._view_mode == "mode":
-            self._select_mode(raw)
         elif self._view_mode == "watch":
             self._select_watch(raw)
         elif self._view_mode == "update":
@@ -4977,7 +4984,7 @@ class TimexApp(App):
         elif self._view_mode == "project_edit":
             self._project_editing = None
             self._enter_view("project", "  Enter number or type new project name • /back to return")
-        elif self._view_mode in ("dates", "help", "timezone", "notification", "edit", "color", "stats", "project", "watch", "confirm_reset", "export", "update", "confirm_create_sheets", "mode"):
+        elif self._view_mode in ("dates", "help", "timezone", "notification", "edit", "color", "stats", "project", "watch", "confirm_reset", "export", "update", "confirm_create_sheets"):
             self._editing_task = None
             self._leave_view()
         else:
