@@ -128,7 +128,7 @@ def main() -> None:
 
     window = webview.create_window(
         title="Timex",
-        url=f"http://{HOST}:{PORT}/?fontsize=12",
+        url=f"http://{HOST}:{PORT}/?fontsize=14",
         width=400,
         height=732,
         background_color=BG,
@@ -194,7 +194,7 @@ def main() -> None:
                     pass
                 time.sleep(0.5)  # let textual-serve start fresh subprocess
                 try:
-                    window.load_url(f"http://{HOST}:{PORT}/?fontsize=12")
+                    window.load_url(f"http://{HOST}:{PORT}/?fontsize=14")
                 except Exception:
                     pass
 
