@@ -664,7 +664,7 @@ class TimexApp(App):
         if self._ui_mode == "simple":
             return
         inp = self.query_one("#task-input", HistoryInput)
-        inp.animate("opacity", 0.0, duration=0.15, on_complete=self._finish_lock)
+        inp.styles.animate("opacity", 0.0, duration=0.15, on_complete=self._finish_lock)
 
     def _finish_lock(self) -> None:
         inp = self.query_one("#task-input", HistoryInput)
@@ -676,13 +676,13 @@ class TimexApp(App):
         btn.styles.opacity = 0.0
         btn.display = True
         self._update_simple_btn()
-        btn.animate("opacity", 1.0, duration=0.15)
+        btn.styles.animate("opacity", 1.0, duration=0.15)
         self._render_footer()
 
     def _enter_unlock(self) -> None:
         """Unlock: fade button out, fade input in."""
         btn = self.query_one("#simple-btn", Static)
-        btn.animate("opacity", 0.0, duration=0.15, on_complete=self._finish_unlock)
+        btn.styles.animate("opacity", 0.0, duration=0.15, on_complete=self._finish_unlock)
 
     def _finish_unlock(self) -> None:
         btn = self.query_one("#simple-btn", Static)
@@ -693,7 +693,7 @@ class TimexApp(App):
         self._save_config("ui_mode", "cli")
         inp.styles.opacity = 0.0
         inp.display = True
-        inp.animate("opacity", 1.0, duration=0.15)
+        inp.styles.animate("opacity", 1.0, duration=0.15)
         inp.focus()
         self._render_footer()
 
