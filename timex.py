@@ -165,8 +165,8 @@ class TaskEntry:
 
 STATE_COMMANDS: dict[str, list[str]] = {
     IDLE:    ["/start", "/new", "/date", "/stats", "/export", "/edit", "/clear", "/help", "/timezone", "/notification", "/color", "/project", "/lock", "/update", "/reload"],
-    RUNNING: ["/pause", "/add", "/remove", "/sleep", "/watch", "/reset", "/new", "/clear", "/date", "/stats", "/export", "/edit", "/help", "/timezone", "/notification", "/color", "/project", "/lock", "/update", "/reload"],
-    PAUSED:  ["/resume", "/watch", "/reset", "/new", "/clear", "/date", "/stats", "/export", "/edit", "/help", "/timezone", "/notification", "/color", "/project", "/lock", "/update", "/reload"],
+    RUNNING: ["/pause", "/add", "/remove", "/sleep", "/track", "/reset", "/new", "/clear", "/date", "/stats", "/export", "/edit", "/help", "/timezone", "/notification", "/color", "/project", "/lock", "/update", "/reload"],
+    PAUSED:  ["/resume", "/track", "/reset", "/new", "/clear", "/date", "/stats", "/export", "/edit", "/help", "/timezone", "/notification", "/color", "/project", "/lock", "/update", "/reload"],
 }
 
 
@@ -530,7 +530,7 @@ class TimexApp(App):
         self._sleep_at: float = 0.0  # monotonic time when /sleep should fire
 
         # ── Watch (window activity monitor) ──
-        self._watch_mode: str | None = None        # "screenshot" | "focus" | None
+        self._watch_mode: str | None = None        # "screenshot" | None
         self._watch_window_id: int | None = None   # CGWindowID
         self._watch_window_name: str | None = None  # "App — Title"
         self._watch_pid: int | None = None         # target process PID
@@ -1191,12 +1191,11 @@ class TimexApp(App):
         parts = [f"[{DIM}]{today}[/]"]
         if self._watch_mode is not None:
             if self._watch_thinking:
-                parts.append(f"[italic {DIM}]watch: thinking[/]")
+                parts.append(f"[italic {DIM}]track: thinking[/]")
             elif self._watch_ai_pending:
-                parts.append(f"[{DIM}]watch: [{self._accent}]analyzing...[/][/]")
+                parts.append(f"[{DIM}]track: [{self._accent}]analyzing...[/][/]")
             else:
-                mode_label = "Single" if self._watch_mode == "screenshot" else "Multiple"
-                parts.append(f"[{DIM}]watch: [{self._accent}]{mode_label}[/][/]")
+                parts.append(f"[{DIM}]track: [{self._accent}]active[/][/]")
         footer = Text.from_markup("  ".join(parts))
         footer.justify = "center"
         self.query_one("#footer-bar", Static).update(footer)
@@ -1284,8 +1283,8 @@ class TimexApp(App):
             self._cmd_lock()
         elif cmd == "/project":
             self._cmd_project()
-        elif cmd == "/watch":
-            self._cmd_watch()
+        elif cmd == "/track":
+            self._cmd_track()
         elif self._view_mode == "edit":
             self._submit_edit(raw)
         elif self._view_mode == "dates" and raw.isdigit():
@@ -1736,9 +1735,9 @@ class TimexApp(App):
 
     # ── Watch (window activity monitor) ───────────────────────────────────
 
-    def _cmd_watch(self) -> None:
+    def _cmd_track(self) -> None:
         if self.state == IDLE:
-            # Auto-start timer so watch can begin immediately
+            # Auto-start timer so track can begin immediately
             self.state = RUNNING
             self.session_start = self._now()
             self.total_paused = timedelta()
@@ -1748,8 +1747,8 @@ class TimexApp(App):
             self._reset_reminder()
             self._save_state()
         self._watch_used = True
-        self._watch_step = "mode"
-        self._watch_windows = []
+        self._watch_step = "window"
+        self._watch_windows = self._get_window_list()
         self._enter_view("watch", "  Enter number \u2022 /back to return")
 
     @staticmethod
@@ -1861,8 +1860,9 @@ class TimexApp(App):
     def _render_watch(self) -> None:
         rows = []
 
-        if self._watch_step == "mode":
+        if self._watch_step == "window":
             if self._watch_mode is not None:
+                # Track already active — show status + Off/Switch options
                 watch_lost = getattr(self, '_watch_lost', False)
                 if watch_lost:
                     status = f"[bold #e06c75]\u26a0 Lost[/]"
@@ -1870,83 +1870,27 @@ class TimexApp(App):
                     status = f"[bold #e06c75]Thinking[/]"
                 else:
                     status = f"[bold #98c379]Working[/]"
-                mode_display = "Single" if self._watch_mode == "screenshot" else "Multiple"
                 rows.append(Text.from_markup(
-                    f"[bold {TEXT_COLOR}]Watch active: {mode_display} mode[/]"
+                    f"[bold {TEXT_COLOR}]Track active[/]"
                 ))
-                if self._watch_mode == "focus":
-                    # Per-app breakdown
-                    if self._watch_focus_stats:
-                        apps = sorted(self._watch_focus_stats.items(),
-                                      key=lambda x: x[1]["total"], reverse=True)[:8]
-                        max_total = apps[0][1]["total"] if apps else 1
-                        for app_name, stats in apps:
-                            t_secs = stats["total"] * 5
-                            t_str = self._fmt_uptime(t_secs)
-                            act_pct = int(stats["active"] / stats["total"] * 100) if stats["total"] else 0
-                            bar_w = 10
-                            filled = max(0, round(stats["total"] / max_total * bar_w)) if max_total else 0
-                            empty = bar_w - filled
-                            abar = f"[{self._accent}]{'█' * filled}[/][#333]{'░' * empty}[/]"
-                            display_name = app_name if len(app_name) <= 18 else app_name[:15] + "..."
-                            rows.append(Text.from_markup(
-                                f"[{TEXT_COLOR}]{display_name:<18}[/] {abar} [{DIM}]{t_str:>5}  active {act_pct}%[/]"
-                            ))
-                else:
-                    rows.append(Text.from_markup(
-                        f"[{DIM}]Window: {self._watch_window_name or 'Unknown'}[/]"
-                    ))
+                rows.append(Text.from_markup(
+                    f"[{DIM}]Window: {self._watch_window_name or 'Unknown'}[/]"
+                ))
                 rows.append(Text.from_markup(f"[{DIM}]Status: [/]{status}"))
-
-                # Activity meter (keyboard + clicks over 10 min window)
-                level, breakdown = self._compute_activity_level()
-                bar_w = 20
-                filled = max(0, round(level / 100 * bar_w))
-                empty = bar_w - filled
-                if level >= 70:
-                    bar_color = "#98c379"
-                elif level >= 30:
-                    bar_color = self._accent
-                else:
-                    bar_color = "#e06c75"
-                bar = f"[{bar_color}]{'█' * filled}[/][#333]{'░' * empty}[/]"
                 rows.append(Text(""))
-                rows.append(Text.from_markup(f"[{DIM}]Activity[/]  {bar}  [{bar_color}]{level}%[/]"))
-                rows.append(Text.from_markup(f"[{DIM}]{breakdown}[/]"))
+                rows.append(Text.from_markup(f"[{SEPARATOR}]{'─' * 50}[/]"))
+                rows.append(Text.from_markup(
+                    f"[bold {self._accent}]0.[/] [{TEXT_COLOR}]Off[/]"
+                ))
+                rows.append(Text.from_markup(f"[{SEPARATOR}]{'─' * 50}[/]"))
+                # Show window list below for switching
+                if not self._watch_windows:
+                    self._watch_windows = self._get_window_list()
 
-                rows.append(Text.from_markup(f"[{SEPARATOR}]{'─' * 50}[/]"))
-                rows.append(Text.from_markup(
-                    f"[bold {self._accent}]1.[/] [{TEXT_COLOR}]Off[/]"
-                ))
-                rows.append(Text.from_markup(f"[{SEPARATOR}]{'─' * 50}[/]"))
-                ss_hint = f" — {self._watch_window_name}" if self._watch_mode == "screenshot" and self._watch_window_name else " (one window)"
-                ss_warn = " [bold #e06c75]\u26a0[/]" if watch_lost and self._watch_mode == "screenshot" else ""
-                rows.append(Text.from_markup(
-                    f"[bold {self._accent}]2.[/] [{TEXT_COLOR}]Single[/]{ss_warn} [{DIM}]{ss_hint}[/]"
-                ))
-                rows.append(Text.from_markup(f"[{SEPARATOR}]{'─' * 50}[/]"))
-                focus_warn = " [bold #e06c75]\u26a0[/]" if watch_lost and self._watch_mode == "focus" else ""
-                rows.append(Text.from_markup(
-                    f"[bold {self._accent}]3.[/] [{TEXT_COLOR}]Multiple[/]{focus_warn} [{DIM}](auto-tracks active window) BETA[/]"
-                ))
-            else:
-                rows.append(Text.from_markup(
-                    f"[bold {TEXT_COLOR}]Select detection mode:[/]"
-                ))
-                rows.append(Text.from_markup(f"[{SEPARATOR}]{'─' * 50}[/]"))
-                rows.append(Text.from_markup(
-                    f"[bold {self._accent}]1.[/] [{TEXT_COLOR}]Single[/] [{DIM}](one window)[/]"
-                ))
-                rows.append(Text.from_markup(f"[{SEPARATOR}]{'─' * 50}[/]"))
-                rows.append(Text.from_markup(
-                    f"[bold {self._accent}]2.[/] [{TEXT_COLOR}]Multiple[/] [{DIM}](auto-tracks active window) BETA[/]"
-                ))
-
-        elif self._watch_step == "window":
             if not self._watch_windows:
                 self._watch_windows = self._get_window_list()
             rows.append(Text.from_markup(
-                f"[bold {TEXT_COLOR}]Select window to watch:[/]"
+                f"[bold {TEXT_COLOR}]Select window to track:[/]"
             ))
             max_up = max((w["uptime"] for w in self._watch_windows), default=0)
             for i, win in enumerate(self._watch_windows, start=1):
@@ -1955,7 +1899,6 @@ class TimexApp(App):
                     name_part = f"[{TEXT_COLOR}]{win['app']}[/] [{DIM}]— {win['title']}[/]"
                 else:
                     name_part = f"[{TEXT_COLOR}]{win['app']}[/]"
-                # Uptime bar
                 up = win.get("uptime", 0)
                 bar_w = 8
                 filled = max(0, round(up / max_up * bar_w)) if max_up > 0 and up > 0 else 0
@@ -1974,54 +1917,26 @@ class TimexApp(App):
         self.query_one("#history", Static).update(Group(*rows))
 
     def _select_watch(self, raw: str) -> None:
-        if self._watch_step == "mode":
-            if not raw.isdigit():
-                self._toast("Enter a number")
-                return
-            num = int(raw)
-            if self._watch_mode is not None:
-                if num == 1:
-                    self._stop_watch()
-                    self._leave_view("Watch stopped")
-                    return
-                elif num == 2:
-                    pending_mode = "screenshot"
-                elif num == 3:
-                    pending_mode = "focus"
-                else:
-                    self._toast("Enter 1\u20133")
-                    return
-            else:
-                if num == 1:
-                    pending_mode = "screenshot"
-                elif num == 2:
-                    pending_mode = "focus"
-                else:
-                    self._toast("Enter 1\u20132")
-                    return
-            self._watch_mode = pending_mode
-            if pending_mode == "focus":
-                self._start_watch()
-                self._leave_view("Watch: Multiple")
-                return
-            self._watch_step = "window"
-            self._watch_windows = self._get_window_list()
-            self._render_history()
-
-        elif self._watch_step == "window":
-            if not raw.isdigit():
-                self._toast("Enter a number")
-                return
-            num = int(raw)
-            if num < 1 or num > len(self._watch_windows):
-                self._toast(f"Enter 1\u2013{len(self._watch_windows)}")
-                return
-            win = self._watch_windows[num - 1]
-            self._watch_window_id = win["id"]
-            self._watch_window_name = f"{win['app']} \u2014 {win['title']}"
-            self._watch_pid = win["pid"]
-            self._start_watch()
-            self._leave_view(f"Watch: Single \u2014 {self._watch_window_name}")
+        if not raw.isdigit():
+            self._toast("Enter a number")
+            return
+        num = int(raw)
+        # 0 = turn off (only when track is active)
+        if num == 0 and self._watch_mode is not None:
+            self._stop_watch()
+            self._leave_view("Track stopped")
+            return
+        if num < 1 or num > len(self._watch_windows):
+            max_n = len(self._watch_windows)
+            self._toast(f"Enter 1\u2013{max_n}" if max_n else "No windows")
+            return
+        win = self._watch_windows[num - 1]
+        self._watch_mode = "screenshot"
+        self._watch_window_id = win["id"]
+        self._watch_window_name = f"{win['app']} \u2014 {win['title']}"
+        self._watch_pid = win["pid"]
+        self._start_watch()
+        self._leave_view(f"Track: {self._watch_window_name}")
 
     def _start_watch(self) -> None:
         now = _time.monotonic()
@@ -2107,8 +2022,6 @@ class TimexApp(App):
             try:
                 if wmode == "screenshot":
                     result = self._check_watch_screenshot()
-                elif wmode == "focus":
-                    result = self._check_watch_focus()
                 else:
                     result = (True, -1.0)
                 self._watch_bg_result = result
@@ -2122,13 +2035,6 @@ class TimexApp(App):
 
     def _process_watch_result(self, is_active: bool, change_pct: float) -> None:
         """Process watch check result (called on main thread)."""
-        # In focus mode, check keyboard/mouse as backup activity signal
-        if not is_active and self._watch_mode == "focus" and self._activity_log:
-            last = self._activity_log[-1]
-            if (_time.time() - last["ts"]) < 30:
-                if last["kbd"] > 0 or last["click"] > 0 or last["scroll"] > 0:
-                    is_active = True  # user is typing/clicking
-
         # Log activity
         wall_ts = _time.time()
         self._watch_activity.append((wall_ts, 1.0 if is_active else 0.0))
@@ -2314,130 +2220,6 @@ class TimexApp(App):
                     return
         except Exception:
             pass
-
-    def _check_watch_focus(self) -> tuple[bool, float]:
-        """Track frontmost app, screenshot it, compare pixels."""
-        try:
-            import AppKit as _AK
-            front = _AK.NSWorkspace.sharedWorkspace().frontmostApplication()
-            if front is None:
-                return True, -1.0
-            app_name = front.localizedName() or "Unknown"
-            app_pid = front.processIdentifier()
-        except Exception:
-            return True, -1.0
-
-        # Skip Timex itself
-        if app_name == "Timex":
-            return True, -1.0
-
-        # If app changed, reset pixel baseline and schedule early AI check
-        if app_pid != self._watch_pid:
-            self._watch_pid = app_pid
-            self._watch_window_name = app_name
-            self._watch_last_pixels = None
-            self._watch_app_changed_at = _time.monotonic()
-            self._watch_last_active = _time.monotonic()  # app switch = real activity
-
-        # Find window ID for this PID
-        try:
-            from Quartz import (
-                CGWindowListCopyWindowInfo,
-                CGWindowListCreateImage,
-                CGRectNull,
-                kCGWindowListOptionOnScreenOnly,
-                kCGWindowListExcludeDesktopElements,
-                kCGWindowListOptionIncludingWindow,
-                kCGWindowImageBoundsIgnoreFraming,
-                kCGNullWindowID,
-                CGImageGetDataProvider,
-                CGDataProviderCopyData,
-            )
-        except ImportError:
-            return True, -1.0
-
-        # Get first layer-0 window for this PID
-        windows = CGWindowListCopyWindowInfo(
-            kCGWindowListOptionOnScreenOnly | kCGWindowListExcludeDesktopElements,
-            kCGNullWindowID,
-        )
-        wid = None
-        win_title = ""
-        if windows:
-            for w in windows:
-                if w.get("kCGWindowOwnerPID", 0) == app_pid and w.get("kCGWindowLayer", -1) == 0:
-                    wid = w.get("kCGWindowNumber", 0)
-                    win_title = w.get("kCGWindowName", "") or ""
-                    break
-        if not wid:
-            return True, -1.0
-
-        # Screenshot
-        image = CGWindowListCreateImage(
-            CGRectNull,
-            kCGWindowListOptionIncludingWindow,
-            wid,
-            kCGWindowImageBoundsIgnoreFraming,
-        )
-        if image is None:
-            return True, -1.0
-
-        provider = CGImageGetDataProvider(image)
-        if provider is None:
-            return True, -1.0
-        pixel_data = CGDataProviderCopyData(provider)
-        if pixel_data is None or len(pixel_data) == 0:
-            return True, -1.0
-
-        # Sample 2KB from middle
-        data_len = len(pixel_data)
-        sample_size = 2048
-        mid = data_len // 2
-        start = max(0, mid - sample_size // 2)
-        sampled = bytes(pixel_data[start:start + sample_size])
-
-        if self._watch_last_pixels is None:
-            self._watch_last_pixels = sampled
-            is_active = False  # baseline only — app switch already counted as activity
-            pct = 0.0
-        else:
-            changed = sum(1 for a, b in zip(self._watch_last_pixels, sampled) if abs(a - b) > 8)
-            self._watch_last_pixels = sampled
-            total = len(sampled)
-            pct = changed / total if total > 0 else 0.0
-            is_active = pct > 0.003
-
-        # Log per-app stats
-        now = _time.time()
-        if app_name not in self._watch_focus_stats:
-            self._watch_focus_stats[app_name] = {"active": 0, "total": 0, "first_ts": now}
-        stats = self._watch_focus_stats[app_name]
-        stats["total"] += 1
-        if is_active:
-            stats["active"] += 1
-
-        # AI analysis: every 180s normally, or 30s after app switch (cooldown 60s)
-        mono_now = _time.monotonic()
-        elapsed_ai = mono_now - self._watch_last_ai_check
-        app_switch_ago = mono_now - self._watch_app_changed_at if self._watch_app_changed_at else 999
-        should_trigger = elapsed_ai >= 180.0 or (
-            elapsed_ai >= 60.0  # cooldown: no more than once per 60s
-            and self._watch_app_changed_at > self._watch_last_ai_check
-            and app_switch_ago >= 30.0
-        )
-        if not self._watch_ai_pending and should_trigger:
-            full_app = f"{app_name} — {win_title}" if win_title else app_name
-            # Append session app stats for AI context
-            if self._watch_focus_stats:
-                top = sorted(self._watch_focus_stats.items(), key=lambda x: x[1]["total"], reverse=True)[:3]
-                ctx = ", ".join(f"{n}({s['total']*5//60}m)" for n, s in top if s["total"] * 5 >= 60)
-                if ctx:
-                    full_app += f" [session: {ctx}]"
-            self._ai_log(f"triggering AI (elapsed={elapsed_ai:.0f}s, app_switch={app_switch_ago:.0f}s, app={full_app})")
-            self._watch_last_ai_check = mono_now
-            self._trigger_ai_analysis(image, full_app)
-
-        return is_active, pct
 
     def _build_task_history_context(self) -> str:
         """Build a short summary of recent tasks for AI context."""
@@ -2686,7 +2468,7 @@ class TimexApp(App):
 
     def _apply_ai_task(self, label: str) -> None:
         """Apply AI-suggested task label (called on main thread)."""
-        if self.state != RUNNING or self._watch_mode not in ("focus", "screenshot"):
+        if self.state != RUNNING or self._watch_mode != "screenshot":
             return
         # Filter junk labels
         if label.lower().strip() in self._JUNK_LABELS:
@@ -3996,7 +3778,7 @@ class TimexApp(App):
             ("/timezone", "Change timezone for tracking"),
             ("/notification", "Set reminder interval"),
             ("/sleep", "Auto-pause after duration (e.g. 30m, 1h)"),
-            ("/watch", "Monitor window activity (auto Thinking/Working)"),
+            ("/track", "Monitor window activity (auto Thinking/Working)"),
             ("/reset", "Reset session (discard without saving)"),
             ("/project", "Switch project"),
             ("/reload", "Reload app (apply code changes)"),
