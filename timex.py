@@ -17,6 +17,8 @@ Commands:
 
 from __future__ import annotations
 
+import base64
+import io
 import json
 import logging
 import os
@@ -25,7 +27,9 @@ import sys
 import threading
 import time as _time
 import traceback
-from datetime import datetime, timedelta
+import webbrowser
+from datetime import date, datetime, timedelta
+from html import escape as _esc
 from pathlib import Path
 from zoneinfo import ZoneInfo
 import re
@@ -76,17 +80,23 @@ DIMMER = "#333333"
 SEPARATOR = "#222222"
 TEXT_COLOR = "#d4d4d4"
 
+
 DEFAULT_REMINDER_INTERVAL = 30 * 60  # 30 minutes in seconds
 
 STATE_DIR = Path.home() / ".timex"
 PROJECTS_DIR = STATE_DIR / "projects"
+BACKUP_DIR = STATE_DIR / "backups"
+BACKUP_KEEP = 30  # the whole tree is ~200 KB, so keeping a month of them is free
 ACTIVE_PROJECT_FILE = STATE_DIR / "active_project"
 AUTOSAVE_INTERVAL = 30  # seconds between autosaves during tick
 CONFIG_FILE = STATE_DIR / "config.json"
 AI_USAGE_FILE = STATE_DIR / "ai_usage.json"
 CRASH_LOG = STATE_DIR / "crash.log"
 
-VERSION = "1.0.3"
+VERSION = "1.1.0"
+# Patching these in place rewrites files inside the bundle, which breaks the
+# notarised signature. Updates therefore ship as a fresh signed app: changelog
+# entries default to dmg_required, and self-patching is opt-in per release.
 UPDATE_FILES = ["timex.py", "menubar.py", "launcher.py", "serve.py"]
 UPDATE_BASE_URL = "https://raw.githubusercontent.com/halinskiy/timex/main"
 CHANGELOG_URL = f"{UPDATE_BASE_URL}/changelog.json"
@@ -164,9 +174,9 @@ class TaskEntry:
 # ── Command suggestions ──────────────────────────────────────────────────────
 
 STATE_COMMANDS: dict[str, list[str]] = {
-    IDLE:    ["/start", "/new", "/date", "/stats", "/export", "/edit", "/clear", "/help", "/timezone", "/notification", "/color", "/project", "/lock", "/update", "/reload"],
-    RUNNING: ["/pause", "/add", "/remove", "/sleep", "/track", "/reset", "/new", "/clear", "/date", "/stats", "/export", "/edit", "/help", "/timezone", "/notification", "/color", "/project", "/lock", "/update", "/reload"],
-    PAUSED:  ["/resume", "/track", "/reset", "/new", "/clear", "/date", "/stats", "/export", "/edit", "/help", "/timezone", "/notification", "/color", "/project", "/lock", "/update", "/reload"],
+    IDLE:    ["/start", "/new", "/date", "/stats", "/export", "/edit", "/clear", "/help", "/timezone", "/notification", "/color", "/project", "/update", "/reload"],
+    RUNNING: ["/pause", "/add", "/remove", "/sleep", "/track", "/reset", "/new", "/clear", "/date", "/stats", "/export", "/edit", "/help", "/timezone", "/notification", "/color", "/project", "/update", "/reload"],
+    PAUSED:  ["/resume", "/track", "/reset", "/new", "/clear", "/date", "/stats", "/export", "/edit", "/help", "/timezone", "/notification", "/color", "/project", "/update", "/reload"],
 }
 
 
@@ -439,13 +449,6 @@ class TimexApp(App):
         color: #555555;
     }
 
-    #simple-btn {
-        margin: 0 2 0 2;
-        border: tall #333333;
-        background: #1e1e1e;
-        content-align: center middle;
-        display: none;
-    }
 
     #toast-bar {
         height: auto;
@@ -475,12 +478,11 @@ class TimexApp(App):
     def _leave_view(self, toast_msg: str | None = None) -> None:
         """Return to timeline from any sub-view."""
         self._view_mode = "timeline"
-        self._export_connecting = False
+        self._export_range_input = False
         if toast_msg:
             self._toast(toast_msg)
         self._mark_dirty()
         self._update_placeholder()
-        self._apply_mode()
 
     @staticmethod
     def _parse_duration(raw: str) -> float:
@@ -536,10 +538,9 @@ class TimexApp(App):
         self._reminder_interval: int = DEFAULT_REMINDER_INTERVAL
         self._edit_index: int = 0  # selected task index in edit mode
         self._editing_task: int | None = None  # index of task being renamed
-        self._export_connecting: bool = False  # waiting for spreadsheet URL paste
-        self._confirm_sheets_ctx: dict = {}  # context for confirm_create_sheets view
-        self._ui_mode: str = "cli"  # "cli" or "simple"
-        self._btn_pressing: bool = False
+        self._export_range_input: bool = False  # waiting for custom date range
+        self._export_period: str = "today"  # today | week | month | range
+        self._export_range: tuple | None = None  # (date_from, date_to) for custom range
         self._viewing_sessions: list[dict] = []
         self._session_edit_index: int = 0
         self._editing_session: int | None = None
@@ -594,7 +595,6 @@ class TimexApp(App):
         yield scroll
         yield Static(id="toast-bar")
         yield HistoryInput(app_ref=self, placeholder="  What are you working on?  (/start to begin)", id="task-input")
-        yield Static(id="simple-btn")
         yield Static(id="footer-bar")
 
     # ── Project paths ──────────────────────────────────────────────────
@@ -631,101 +631,13 @@ class TimexApp(App):
         self.set_interval(0.5, self._tick)
         self._mark_dirty()
         self._update_placeholder()
-        self.call_after_refresh(self._apply_mode)
+        self.call_after_refresh(lambda: self.query_one("#task-input", HistoryInput).focus())
+        self._snapshot("daily", once_per_day=True)
         threading.Thread(target=self._check_update_bg, daemon=True).start()
 
     def on_click(self) -> None:
-        if self._ui_mode == "simple" and self._view_mode == "timeline":
-            return  # clicks do nothing in simple mode on timeline
         self.query_one("#task-input", HistoryInput).focus()
 
-    # ── Simple mode ───────────────────────────────────────────────────────
-
-    def _apply_mode(self) -> None:
-        inp = self.query_one("#task-input", HistoryInput)
-        btn = self.query_one("#simple-btn", Static)
-        if self._ui_mode == "simple":
-            inp.display = False
-            btn.display = True
-            self._update_simple_btn()
-        else:
-            btn.display = False
-            inp.display = True
-            inp.focus()
-
-    def _update_simple_btn(self) -> None:
-        btn = self.query_one("#simple-btn", Static)
-        accent = self._accent
-        if self.state == RUNNING:
-            btn.update(Text.from_markup(f"[bold {accent}]\u275a\u275a[/]"))
-            btn.styles.background = "#1e1e1e"
-        elif self.state == PAUSED:
-            btn.update(Text.from_markup(f"[bold #171717]\u25ba\u275a[/]"))
-            btn.styles.background = accent
-        else:
-            btn.update(Text.from_markup(f"[bold #171717]\u25b6\ufe0e[/]"))
-            btn.styles.background = accent
-
-    def on_key(self, event: Key) -> None:
-        if self._ui_mode != "simple":
-            return
-        if self._view_mode == "timeline":
-            if event.key in ("enter", "space"):
-                event.stop()
-                if self._btn_pressing:
-                    return  # ignore key repeat
-                self._btn_pressing = True
-                # Pressed visual
-                btn = self.query_one("#simple-btn", Static)
-                if self.state == RUNNING:
-                    btn.styles.background = "#2a2a2a"
-                else:
-                    a = self._accent.lstrip("#")
-                    r, g, b = int(a[0:2], 16), int(a[2:4], 16), int(a[4:6], 16)
-                    btn.styles.background = f"#{int(r*0.75):02x}{int(g*0.75):02x}{int(b*0.75):02x}"
-                # Execute action
-                if self.state == IDLE:
-                    self._cmd_start()
-                elif self.state == RUNNING:
-                    self._cmd_pause()
-                elif self.state == PAUSED:
-                    self._cmd_resume()
-                # Restore normal color after 100ms
-                self.set_timer(0.1, self._btn_restore)
-            elif event.key == "escape":
-                event.stop()
-                self._enter_unlock()
-
-    def _btn_restore(self) -> None:
-        self._btn_pressing = False
-        if self._ui_mode == "simple":
-            self._update_simple_btn()
-
-    # ── /lock ─────────────────────────────────────────────────────────────
-
-    def _cmd_lock(self) -> None:
-        """Lock: instantly switch input → button."""
-        if self._ui_mode == "simple":
-            return
-        inp = self.query_one("#task-input", HistoryInput)
-        btn = self.query_one("#simple-btn", Static)
-        inp.display = False
-        self._ui_mode = "simple"
-        self._save_config("ui_mode", "simple")
-        btn.display = True
-        self._update_simple_btn()
-        self._render_footer()
-
-    def _enter_unlock(self) -> None:
-        """Unlock: instantly switch button → input."""
-        btn = self.query_one("#simple-btn", Static)
-        inp = self.query_one("#task-input", HistoryInput)
-        btn.display = False
-        self._ui_mode = "cli"
-        self._save_config("ui_mode", "cli")
-        inp.display = True
-        inp.focus()
-        self._render_footer()
 
     # ── Timezone ──────────────────────────────────────────────────────────
 
@@ -748,9 +660,6 @@ class TimexApp(App):
                 if color and re.match(r"^#[0-9a-fA-F]{6}$", color):
                     self._accent = color.lower()
                     self._accent_hex = color.lstrip("#").upper()
-                ui_mode = cfg.get("ui_mode")
-                if ui_mode in ("cli", "simple"):
-                    self._ui_mode = ui_mode
         except (OSError, json.JSONDecodeError, KeyError):
             pass
 
@@ -879,8 +788,6 @@ class TimexApp(App):
                     self._save_state()
             elif self._update_notified or self._is_input_waiting() or self._input_wait_t > 0.0:
                 self._render_footer()
-            if self._ui_mode == "simple" and self._view_mode == "timeline":
-                self._update_simple_btn()
         except Exception:
             CRASH_LOG.parent.mkdir(parents=True, exist_ok=True)
             CRASH_LOG.write_text(traceback.format_exc())
@@ -888,7 +795,7 @@ class TimexApp(App):
 
     def _render_all(self) -> None:
         self._render_timer()
-        if self._dirty_history:
+        if self._dirty_history or (self.state == RUNNING and self.tasks and self.tasks[-1].active_end is None):
             self._render_history()
             self._dirty_history = False
         self._render_footer()
@@ -1012,10 +919,6 @@ class TimexApp(App):
         if self._view_mode == "update":
             scroll.border_title = "Update"
             self._render_update()
-            return
-        if self._view_mode == "confirm_create_sheets":
-            scroll.border_title = "Create Sheets"
-            self._render_confirm_create_sheets()
             return
         if self._view_mode == "dates":
             scroll.border_title = "History"
@@ -1254,6 +1157,7 @@ class TimexApp(App):
                 self._toast("Session renamed")
             else:
                 # Delete session
+                self._snapshot("session-delete")
                 self._viewing_sessions.pop(idx)
                 self._save_sessions_to_history()
                 self._toast("Session deleted")
@@ -1321,13 +1225,13 @@ class TimexApp(App):
 
     def _is_input_waiting(self) -> bool:
         """True when app is waiting for freeform text from user."""
-        if self._export_connecting:
+        if self._export_range_input:
             return True
         if self._view_mode == "edit" and self._editing_task is not None:
             return True
         if self._view_mode == "project_edit" and self._project_editing is not None:
             return True
-        if self._view_mode in ("timezone", "notification", "confirm_create_sheets"):
+        if self._view_mode in ("timezone", "notification"):
             return True
         return False
 
@@ -1344,11 +1248,6 @@ class TimexApp(App):
         return f"#{r:02x}{g:02x}{b:02x}"
 
     def _render_footer(self) -> None:
-        if self._ui_mode == "simple":
-            footer = Text.from_markup(f"  [{DIM}]Esc \u00b7 unlock  \u2502  Space \u00b7 continue[/]")
-            footer.justify = "center"
-            self.query_one("#footer-bar", Static).update(footer)
-            return
         # Animate input border: accent ↔ blue based on waiting state
         waiting = self._is_input_waiting()
         step = 0.15  # per tick (0.5s) → ~3s full transition
@@ -1456,8 +1355,6 @@ class TimexApp(App):
             self._cmd_reload()
         elif cmd == "/update":
             self._cmd_update()
-        elif cmd == "/lock":
-            self._cmd_lock()
         elif cmd == "/project":
             self._cmd_project()
         elif cmd == "/track":
@@ -1484,8 +1381,6 @@ class TimexApp(App):
             self._select_confirm_delete_project(raw)
         elif self._view_mode == "confirm_reset":
             self._select_confirm_reset(raw)
-        elif self._view_mode == "confirm_create_sheets":
-            self._select_confirm_create_sheets(raw)
         elif self._view_mode == "watch":
             self._select_watch(raw)
         elif self._view_mode == "update":
@@ -1667,252 +1562,6 @@ class TimexApp(App):
             self._save_state()
         else:
             self._leave_view("Reset cancelled")
-
-    # ── Confirm Create Sheets ─────────────────────────────────────────────
-
-    def _enter_confirm_create_sheets(self, missing: list) -> None:
-        self._confirm_sheets_ctx["missing"] = missing
-        self._enter_view("confirm_create_sheets", "  y to create, n to cancel")
-
-    def _render_confirm_create_sheets(self) -> None:
-        missing = self._confirm_sheets_ctx.get("missing", [])
-        rows = [
-            Text(""),
-            Text.from_markup(f"[bold {self._accent}]Missing sheets in your spreadsheet:[/]"),
-            Text(""),
-        ]
-        for name in missing:
-            rows.append(Text.from_markup(f"  [{TEXT_COLOR}]• {name}[/]"))
-        rows += [
-            Text(""),
-            Text.from_markup(f"[{SEPARATOR}]{'─' * 50}[/]"),
-            Text.from_markup(f"[bold {self._accent}]y.[/] [{TEXT_COLOR}]Create from template and sync[/]"),
-            Text.from_markup(f"[{SEPARATOR}]{'─' * 50}[/]"),
-            Text.from_markup(f"[bold {self._accent}]n.[/] [{TEXT_COLOR}]Cancel[/]"),
-        ]
-        self.query_one("#history", Static).update(Group(*rows))
-
-    def _select_confirm_create_sheets(self, raw: str) -> None:
-        if raw.lower() not in ("y", "yes", "n", "no"):
-            return
-        if raw.lower() in ("y", "yes"):
-            self._toast("Creating sheets...", 10)
-            ctx = dict(self._confirm_sheets_ctx)
-
-            def _do_create():
-                try:
-                    self._create_template_sheets(ctx["spreadsheet_id"], ctx["missing"], self._sync_dt,
-                                                delete_default=ctx.get("delete_default", False))
-                    self.call_from_thread(self._enter_view, "export", "  select option \u2022 /back")
-                    self.call_from_thread(self._select_export, "1")
-                except Exception as e:
-                    self.call_from_thread(self._toast, f"Create error: {e}", 6)
-                    self.call_from_thread(self._enter_view, "export", "  select option \u2022 /back")
-
-            threading.Thread(target=_do_create, daemon=True).start()
-        else:
-            self._enter_view("export", "  select option \u2022 /back")
-
-    @staticmethod
-    def _create_template_sheets(spreadsheet_id: str, missing_names: list, sync_dt,
-                                delete_default: bool = False) -> None:
-        """Create missing 'Tracker {Month}' and/or 'Report' sheets matching the original template."""
-        import calendar as _calendar
-        from datetime import date as _date
-
-        # Google Sheets date serial: days since 1899-12-30
-        _EPOCH = _date(1899, 12, 30)
-
-        def _date_serial(year, month, day):
-            return (_date(year, month, day) - _EPOCH).days
-
-        gc, _creds = TimexApp._get_gspread_client()
-        spreadsheet = gc.open_by_key(spreadsheet_id)
-
-        for sheet_name in missing_names:
-            if sheet_name.lower().startswith("tracker"):
-                ws = spreadsheet.add_worksheet(sheet_name, rows=500, cols=5)
-                sid = ws.id
-                spreadsheet.batch_update({"requests": [
-                    # Column widths matching template: A=39, B=115, C=80, D=444, E=100
-                    {"updateDimensionProperties": {"range": {"sheetId": sid, "dimension": "COLUMNS",
-                        "startIndex": 0, "endIndex": 1}, "properties": {"pixelSize": 39}, "fields": "pixelSize"}},
-                    {"updateDimensionProperties": {"range": {"sheetId": sid, "dimension": "COLUMNS",
-                        "startIndex": 1, "endIndex": 2}, "properties": {"pixelSize": 115}, "fields": "pixelSize"}},
-                    {"updateDimensionProperties": {"range": {"sheetId": sid, "dimension": "COLUMNS",
-                        "startIndex": 2, "endIndex": 3}, "properties": {"pixelSize": 80}, "fields": "pixelSize"}},
-                    {"updateDimensionProperties": {"range": {"sheetId": sid, "dimension": "COLUMNS",
-                        "startIndex": 3, "endIndex": 4}, "properties": {"pixelSize": 444}, "fields": "pixelSize"}},
-                    {"updateDimensionProperties": {"range": {"sheetId": sid, "dimension": "COLUMNS",
-                        "startIndex": 4, "endIndex": 5}, "properties": {"pixelSize": 100}, "fields": "pixelSize"}},
-                ]})
-
-            elif sheet_name.lower() == "report":
-                year = sync_dt.year
-                month = sync_dt.month
-                days_in_month = _calendar.monthrange(year, month)[1]
-                n = days_in_month
-                total_row_idx = n + 1  # 1-indexed, row after last date
-
-                ws = spreadsheet.add_worksheet(sheet_name, rows=n + 10, cols=5)
-                sid = ws.id
-
-                # Write header as text
-                ws.update("A1", [["Дата", "Проект", "Описание и отчет", "Hours",
-                                  "Link to detailed report"]], value_input_option="RAW")
-
-                # Write dates as serial numbers (actual date values, not strings)
-                date_vals = [[_date_serial(year, month, d), "", "", "", ""]
-                             for d in range(1, n + 1)]
-                ws.update(f"A2:E{n + 1}", date_vals, value_input_option="RAW")
-
-                # Write Total row
-                ws.update(f"A{total_row_idx + 1}",
-                          [["Total", "", "", f"=SUM(D2:D{n + 1})", ""]],
-                          value_input_option="USER_ENTERED")
-
-                GRAY = {"red": 0.9529412, "green": 0.9529412, "blue": 0.9529412}
-                WHITE = {"red": 1.0, "green": 1.0, "blue": 1.0}
-                CREAM = {"red": 1.0, "green": 0.98039216, "blue": 0.92941177}
-                ORANGE = {"red": 1.0, "green": 0.42745098, "blue": 0.003921569}
-                BLACK = {"red": 0.0, "green": 0.0, "blue": 0.0}
-
-                requests = [
-                    # Column widths matching template: A=83, B=385, C=606, D=100, E=200
-                    {"updateDimensionProperties": {"range": {"sheetId": sid, "dimension": "COLUMNS",
-                        "startIndex": 0, "endIndex": 1}, "properties": {"pixelSize": 83}, "fields": "pixelSize"}},
-                    {"updateDimensionProperties": {"range": {"sheetId": sid, "dimension": "COLUMNS",
-                        "startIndex": 1, "endIndex": 2}, "properties": {"pixelSize": 385}, "fields": "pixelSize"}},
-                    {"updateDimensionProperties": {"range": {"sheetId": sid, "dimension": "COLUMNS",
-                        "startIndex": 2, "endIndex": 3}, "properties": {"pixelSize": 606}, "fields": "pixelSize"}},
-                    {"updateDimensionProperties": {"range": {"sheetId": sid, "dimension": "COLUMNS",
-                        "startIndex": 3, "endIndex": 4}, "properties": {"pixelSize": 100}, "fields": "pixelSize"}},
-                    {"updateDimensionProperties": {"range": {"sheetId": sid, "dimension": "COLUMNS",
-                        "startIndex": 4, "endIndex": 5}, "properties": {"pixelSize": 200}, "fields": "pixelSize"}},
-                    # Row height: header=38px, data=37px
-                    {"updateDimensionProperties": {"range": {"sheetId": sid, "dimension": "ROWS",
-                        "startIndex": 0, "endIndex": 1}, "properties": {"pixelSize": 38}, "fields": "pixelSize"}},
-                    {"updateDimensionProperties": {"range": {"sheetId": sid, "dimension": "ROWS",
-                        "startIndex": 1, "endIndex": n + 2}, "properties": {"pixelSize": 37}, "fields": "pixelSize"}},
-                    # Freeze row 1 and col 1
-                    {"updateSheetProperties": {
-                        "properties": {"sheetId": sid, "gridProperties": {
-                            "frozenRowCount": 1, "frozenColumnCount": 1}},
-                        "fields": "gridProperties.frozenRowCount,gridProperties.frozenColumnCount",
-                    }},
-                    # Header row A: bold, CENTER, MIDDLE, bottom+right borders
-                    {"repeatCell": {
-                        "range": {"sheetId": sid, "startRowIndex": 0, "endRowIndex": 1,
-                                  "startColumnIndex": 0, "endColumnIndex": 1},
-                        "cell": {"userEnteredFormat": {
-                            "horizontalAlignment": "CENTER", "verticalAlignment": "MIDDLE",
-                            "textFormat": {"bold": True},
-                            "borders": {"bottom": {"style": "SOLID", "width": 1, "color": BLACK},
-                                        "right": {"style": "SOLID", "width": 1, "color": BLACK}},
-                        }},
-                        "fields": "userEnteredFormat(horizontalAlignment,verticalAlignment,textFormat,borders)",
-                    }},
-                    # Header B-C: CENTER, MIDDLE, bottom border
-                    {"repeatCell": {
-                        "range": {"sheetId": sid, "startRowIndex": 0, "endRowIndex": 1,
-                                  "startColumnIndex": 1, "endColumnIndex": 3},
-                        "cell": {"userEnteredFormat": {
-                            "horizontalAlignment": "CENTER", "verticalAlignment": "MIDDLE",
-                            "borders": {"bottom": {"style": "SOLID", "width": 1, "color": BLACK}},
-                        }},
-                        "fields": "userEnteredFormat(horizontalAlignment,verticalAlignment,borders)",
-                    }},
-                    # Header D-E: CENTER, MIDDLE, bottom+left+right borders
-                    {"repeatCell": {
-                        "range": {"sheetId": sid, "startRowIndex": 0, "endRowIndex": 1,
-                                  "startColumnIndex": 3, "endColumnIndex": 5},
-                        "cell": {"userEnteredFormat": {
-                            "horizontalAlignment": "CENTER", "verticalAlignment": "MIDDLE",
-                            "borders": {"bottom": {"style": "SOLID", "width": 1, "color": BLACK},
-                                        "left": {"style": "SOLID", "width": 1, "color": BLACK},
-                                        "right": {"style": "SOLID", "width": 1, "color": BLACK}},
-                        }},
-                        "fields": "userEnteredFormat(horizontalAlignment,verticalAlignment,borders)",
-                    }},
-                    # Col A data: DATE format, CENTER, MIDDLE, right border
-                    {"repeatCell": {
-                        "range": {"sheetId": sid, "startRowIndex": 1, "endRowIndex": n + 1,
-                                  "startColumnIndex": 0, "endColumnIndex": 1},
-                        "cell": {"userEnteredFormat": {
-                            "numberFormat": {"type": "DATE", "pattern": "dd.MM.yyyy"},
-                            "horizontalAlignment": "CENTER", "verticalAlignment": "MIDDLE",
-                            "borders": {"right": {"style": "SOLID", "width": 1, "color": BLACK}},
-                        }},
-                        "fields": "userEnteredFormat(numberFormat,horizontalAlignment,verticalAlignment,borders)",
-                    }},
-                    # Col B data: orange bold text, CENTER, MIDDLE
-                    {"repeatCell": {
-                        "range": {"sheetId": sid, "startRowIndex": 1, "endRowIndex": n + 1,
-                                  "startColumnIndex": 1, "endColumnIndex": 2},
-                        "cell": {"userEnteredFormat": {
-                            "horizontalAlignment": "CENTER", "verticalAlignment": "MIDDLE",
-                            "textFormat": {"bold": True,
-                                           "foregroundColorStyle": {"rgbColor": ORANGE}},
-                        }},
-                        "fields": "userEnteredFormat(horizontalAlignment,verticalAlignment,textFormat)",
-                    }},
-                    # Col C data: MIDDLE, WRAP
-                    {"repeatCell": {
-                        "range": {"sheetId": sid, "startRowIndex": 1, "endRowIndex": n + 1,
-                                  "startColumnIndex": 2, "endColumnIndex": 3},
-                        "cell": {"userEnteredFormat": {
-                            "verticalAlignment": "MIDDLE", "wrapStrategy": "WRAP",
-                        }},
-                        "fields": "userEnteredFormat(verticalAlignment,wrapStrategy)",
-                    }},
-                    # Col D data: cream bg, left+right borders, CENTER, MIDDLE, fontSize=14
-                    {"repeatCell": {
-                        "range": {"sheetId": sid, "startRowIndex": 1, "endRowIndex": n + 1,
-                                  "startColumnIndex": 3, "endColumnIndex": 4},
-                        "cell": {"userEnteredFormat": {
-                            "backgroundColor": CREAM,
-                            "horizontalAlignment": "CENTER", "verticalAlignment": "MIDDLE",
-                            "textFormat": {"fontSize": 14},
-                            "borders": {"left": {"style": "SOLID", "width": 1, "color": BLACK},
-                                        "right": {"style": "SOLID", "width": 1, "color": BLACK}},
-                        }},
-                        "fields": "userEnteredFormat(backgroundColor,horizontalAlignment,verticalAlignment,textFormat,borders)",
-                    }},
-                    # Col E data: right border, CENTER, MIDDLE, fontSize=12
-                    {"repeatCell": {
-                        "range": {"sheetId": sid, "startRowIndex": 1, "endRowIndex": n + 1,
-                                  "startColumnIndex": 4, "endColumnIndex": 5},
-                        "cell": {"userEnteredFormat": {
-                            "horizontalAlignment": "CENTER", "verticalAlignment": "MIDDLE",
-                            "textFormat": {"fontSize": 12},
-                            "borders": {"right": {"style": "SOLID", "width": 1, "color": BLACK}},
-                            "hyperlinkDisplayType": "LINKED",
-                        }},
-                        "fields": "userEnteredFormat(horizontalAlignment,verticalAlignment,textFormat,borders,hyperlinkDisplayType)",
-                    }},
-                ]
-
-                # Alternating row backgrounds: odd data rows (day 1,3,5...) = GRAY, even = WHITE
-                for i in range(n):
-                    bg = GRAY if i % 2 == 0 else WHITE
-                    requests.append({"repeatCell": {
-                        "range": {"sheetId": sid, "startRowIndex": i + 1, "endRowIndex": i + 2,
-                                  "startColumnIndex": 0, "endColumnIndex": 3},
-                        "cell": {"userEnteredFormat": {"backgroundColor": bg}},
-                        "fields": "userEnteredFormat(backgroundColor)",
-                    }})
-
-                spreadsheet.batch_update({"requests": requests})
-
-        # Delete default sheet (Sheet1 / Лист1) only for freshly created spreadsheets
-        if delete_default:
-            created_titles = {n.lower() for n in missing_names}
-            for ws in spreadsheet.worksheets():
-                if ws.title.lower() not in created_titles:
-                    try:
-                        spreadsheet.del_worksheet(ws)
-                    except Exception:
-                        pass
 
     # ── Watch (window activity monitor) ───────────────────────────────────
 
@@ -2832,994 +2481,659 @@ class TimexApp(App):
 
     # ── /export — Export ─────────────────────────────────────────────────────
 
-    def _get_sync_spreadsheet_id(self) -> "str | None":
-        """Read spreadsheet ID from per-project sheets_config.json."""
-        cfg = self._project_dir() / "sheets_config.json"
-        if cfg.exists():
-            try:
-                data = json.loads(cfg.read_text())
-                return data.get("spreadsheet_id")
-            except (OSError, json.JSONDecodeError):
-                pass
-        return None
-
-    def _get_sync_spreadsheet_title(self) -> "str | None":
-        """Read cached spreadsheet title from per-project sheets_config.json."""
-        cfg = self._project_dir() / "sheets_config.json"
-        if cfg.exists():
-            try:
-                data = json.loads(cfg.read_text())
-                return data.get("title")
-            except (OSError, json.JSONDecodeError):
-                pass
-        return None
-
-    def _save_sync_spreadsheet_id(self, sid: str, title: "str | None" = None) -> None:
-        """Save spreadsheet ID (and optionally title) to per-project sheets_config.json."""
-        cfg = self._project_dir() / "sheets_config.json"
-        cfg.parent.mkdir(parents=True, exist_ok=True)
-        # Preserve existing data
-        existing: dict = {}
-        if cfg.exists():
-            try:
-                existing = json.loads(cfg.read_text())
-            except (OSError, json.JSONDecodeError):
-                pass
-        existing["spreadsheet_id"] = sid
-        if title is not None:
-            existing["title"] = title
-        cfg.write_text(json.dumps(existing))
-
-    def _render_connect_sheet(self) -> None:
-        """Show instructions for connecting an existing spreadsheet."""
-        rows = []
-        rows.append(Text.from_markup(f"[bold {self._accent}]Connect Existing Spreadsheet[/]"))
-        rows.append(Text.from_markup(f"[{SEPARATOR}]{'─' * 50}[/]"))
-        rows.append(Text(""))
-        rows.append(Text.from_markup(f"  [{DIM}]1.[/] [{TEXT_COLOR}]Open Google Sheets in your browser[/]"))
-        rows.append(Text(""))
-        rows.append(Text.from_markup(f"  [{DIM}]2.[/] [{TEXT_COLOR}]Find a spreadsheet with this format:[/]"))
-        rows.append(Text.from_markup(f"      [{DIM}]Report on Hours / Name for Project[/]"))
-        rows.append(Text(""))
-        rows.append(Text.from_markup(f"  [{DIM}]3.[/] [{TEXT_COLOR}]Copy the URL from the address bar[/]"))
-        rows.append(Text.from_markup(f"      [{DIM}]docs.google.com/spreadsheets/d/...[/]"))
-        rows.append(Text(""))
-        rows.append(Text.from_markup(f"  [{DIM}]4.[/] [{TEXT_COLOR}]Paste it below and press Enter[/]"))
-        rows.append(Text(""))
-        rows.append(Text.from_markup(f"[{SEPARATOR}]{'─' * 50}[/]"))
-        has_sheet = self._get_sync_spreadsheet_id() is not None
-        if has_sheet:
-            rows.append(Text.from_markup(
-                f"  [{DIM}]This will replace the currently connected sheet[/]"
-            ))
-        self.query_one("#history", Static).update(Group(*rows))
-
-    def _connect_spreadsheet_url(self, raw: str) -> None:
-        """Parse a Google Sheets URL and save the spreadsheet ID."""
-        # Extract spreadsheet ID from URL: docs.google.com/spreadsheets/d/{ID}/...
-        match = re.search(r"/spreadsheets/d/([a-zA-Z0-9_-]+)", raw)
-        if not match:
-            self._toast("Invalid Google Sheets URL")
-            return
-        ssid = match.group(1)
-        self._save_sync_spreadsheet_id(ssid)
-        self._render_export()
-        inp = self.query_one("#task-input", HistoryInput)
-        inp.placeholder = "  select option • /back"
-        self._toast("Spreadsheet connected")
-
-    @staticmethod
-    def _get_gspread_client():
-        """Authorize gspread via OAuth2 (user's own Google account).
-
-        First run opens browser for consent. Token is cached in ~/.timex/oauth_token.json.
-        Requires ~/.timex/client_secret.json (OAuth2 Desktop Client ID from Google Cloud Console).
-        """
-        import gspread
-        from google.oauth2.credentials import Credentials
-        from google_auth_oauthlib.flow import InstalledAppFlow
-
-        SCOPES = [
-            "https://www.googleapis.com/auth/spreadsheets",
-            "https://www.googleapis.com/auth/drive.file",
-        ]
-        token_path = STATE_DIR / "oauth_token.json"
-        client_secret_path = STATE_DIR / "client_secret.json"
-
-        creds = None
-        if token_path.exists():
-            creds = Credentials.from_authorized_user_file(str(token_path), SCOPES)
-
-        if not creds or not creds.valid:
-            if creds and creds.expired and creds.refresh_token:
-                from google.auth.transport.requests import Request
-                try:
-                    creds.refresh(Request())
-                except Exception:
-                    # Refresh token revoked/expired — re-authorize
-                    token_path.unlink(missing_ok=True)
-                    flow = InstalledAppFlow.from_client_secrets_file(str(client_secret_path), SCOPES)
-                    creds = flow.run_local_server(port=0)
-            else:
-                flow = InstalledAppFlow.from_client_secrets_file(str(client_secret_path), SCOPES)
-                creds = flow.run_local_server(port=0)
-            token_path.write_text(creds.to_json())
-
-        return gspread.authorize(creds), creds
+    _EXPORT_PERIODS = (
+        ("today", "Today"),
+        ("week", "This week"),
+        ("month", "This month"),
+        ("range", "Custom range"),
+    )
 
     def _cmd_export(self) -> None:
-        """Open export view with info and options (today or viewed date from /date)."""
-        # Determine target date: viewed date from /date or today
+        """Open export view: pick a period, save an .xlsx report."""
         if self._view_mode == "history_detail" and self._viewing_date_str:
-            sync_date = self._viewing_date_str
-            self._sync_dt = datetime.strptime(sync_date, "%Y-%m-%d")
-            self._sync_tasks = list(self._viewing_tasks)
-        else:
-            sync_date = self._now().strftime("%Y-%m-%d")
-            self._sync_dt = self._now()
-            self._sync_tasks: list[TaskEntry] = []
-            for session in self._load_history():
-                if session.get("date") == sync_date:
-                    for td in session["tasks"]:
-                        self._sync_tasks.append(self._deserialize_task(td))
-            if self.tasks:
-                # Include current live tasks (even if started on a previous date)
-                task_date = self.tasks[0].wall_start.strftime("%Y-%m-%d")
-                if task_date == sync_date:
-                    for t in self.tasks:
-                        self._sync_tasks.append(t)
-                elif not self._sync_tasks:
-                    # Session spans midnight — use task date instead
-                    sync_date = task_date
-                    self._sync_dt = self.tasks[0].wall_start
-                    for session in self._load_history():
-                        if session.get("date") == sync_date:
-                            for td in session["tasks"]:
-                                self._sync_tasks.append(self._deserialize_task(td))
-                    for t in self.tasks:
-                        self._sync_tasks.append(t)
-            elif not self._sync_tasks and self._last_session_tasks:
-                # Fallback: use last saved session (e.g. after /new)
-                for t in self._last_session_tasks:
-                    self._sync_tasks.append(t)
-                if self._sync_tasks:
-                    sync_date = self._sync_tasks[0].wall_start.strftime("%Y-%m-%d")
-                    self._sync_dt = self._sync_tasks[0].wall_start
+            try:
+                d = datetime.strptime(self._viewing_date_str, "%Y-%m-%d").date()
+                self._export_period = "range"
+                self._export_range = (d, d)
+            except ValueError:
+                self._export_period = "today"
+        if self._export_period == "range" and not self._export_range:
+            self._export_period = "today"
+        self._export_range_input = False
+        self._enter_view("export", "  select option • /back")
 
-        if not self._sync_tasks:
-            self._toast("Nothing to export")
-            return
+    def _period_bounds(self, period: str) -> tuple[date, date]:
+        """Inclusive (from, to) for a period key."""
+        today = self._now().date()
+        if period == "week":
+            return today - timedelta(days=today.weekday()), today
+        if period == "month":
+            return today.replace(day=1), today
+        if period == "range" and self._export_range:
+            return self._export_range
+        return today, today
 
-        # Detect if /watch was used (any task has watched=True)
-        self._sync_watch_used = any(getattr(t, "watched", False) for t in self._sync_tasks)
+    def _period_label(self, period: str) -> str:
+        d1, d2 = self._period_bounds(period)
+        if d1 == d2:
+            return d1.strftime("%A, %B ") + str(d1.day) + d1.strftime(", %Y")
+        if (d1.year, d1.month) == (d2.year, d2.month):
+            return d1.strftime("%B ") + f"{d1.day}–{d2.day}" + d2.strftime(", %Y")
+        return (d1.strftime("%b ") + str(d1.day) + " – "
+                + d2.strftime("%b ") + str(d2.day) + d2.strftime(", %Y"))
 
-        # Compute date range for multi-day sessions
-        first_date = self._sync_tasks[0].wall_start.date()
-        last_task = self._sync_tasks[-1]
-        last_end = last_task.wall_end if last_task.wall_end else self._now()
-        last_date = last_end.date()
+    def _collect_tasks(self, date_from: date, date_to: date) -> list[TaskEntry]:
+        """Tasks starting within [date_from, date_to], chronological.
 
-        def _fmt_single_date(d):
-            dt = datetime.combine(d, datetime.min.time())
-            return dt.strftime("%A, %B ") + str(d.day) + dt.strftime(", %Y")
+        History only gains a session once it is closed with /new, so a stopped
+        session still lives in memory and has to be picked up from there.
+        """
+        out: list[TaskEntry] = []
+        for session in self._load_history():
+            for td in session.get("tasks", []):
+                t = self._deserialize_task(td)
+                if date_from <= t.wall_start.date() <= date_to:
+                    out.append(t)
+        live = self.tasks if self.tasks else self._last_session_tasks
+        for t in live:
+            if date_from <= t.wall_start.date() <= date_to:
+                out.append(t)
+        out.sort(key=lambda t: t.wall_start)
+        return out
 
-        if first_date != last_date:
-            s = datetime.combine(first_date, datetime.min.time())
-            e = datetime.combine(last_date, datetime.min.time())
-            self._sync_date_long = (s.strftime("%A, %B ") + str(first_date.day) +
-                                    " \u2013 " + e.strftime("%A, %B ") + str(last_date.day) +
-                                    e.strftime(", %Y"))
-            self._sync_date_search = [_fmt_single_date(first_date), _fmt_single_date(last_date)]
-            self._sync_link_dates = []
-            d = first_date
-            while d <= last_date:
-                self._sync_link_dates.append(d)
-                d += timedelta(days=1)
-        else:
-            self._sync_date_long = _fmt_single_date(first_date)
-            self._sync_date_search = []
-            self._sync_link_dates = [first_date]
+    def _task_secs(self, t: TaskEntry, active: float) -> float:
+        return t.get_duration(active if t.active_end is None else None)
 
-        # Compute total duration for display
+
+    def _period_tasks(self, period: str) -> tuple[list[TaskEntry], float]:
+        tasks = self._collect_tasks(*self._period_bounds(period))
         active = self._active_seconds()
-        self._sync_total_secs = 0.0
-        for task in self._sync_tasks:
-            self._sync_total_secs += task.get_duration(active if task.active_end is None else None)
-
-        self._enter_view("export", "  select option \u2022 /back")
-
-        # Verify spreadsheet exists in background
-        ssid = self._get_sync_spreadsheet_id()
-        if ssid:
-            def _verify_sheet():
-                try:
-                    gc, creds = self._get_gspread_client()
-                    sp = gc.open_by_key(ssid)
-                    self._save_sync_spreadsheet_id(ssid, sp.title)
-                    self.call_from_thread(self._render_export)
-                except Exception as e:
-                    # Only reset if spreadsheet is confirmed gone (404/not found)
-                    # Don't reset on network errors, timeouts, or auth issues
-                    err_str = str(e).lower()
-                    is_not_found = "404" in err_str or "not found" in err_str
-                    # Log for debugging
-                    try:
-                        with open(CRASH_LOG, "a") as f:
-                            f.write(f"[verify_sheet] {type(e).__name__}: {e}\n")
-                            f.write(f"[verify_sheet] is_not_found={is_not_found}\n")
-                    except OSError:
-                        pass
-                    if is_not_found:
-                        cfg = self._project_dir() / "sheets_config.json"
-                        try:
-                            cfg.unlink()
-                        except OSError:
-                            pass
-                        self.call_from_thread(self._render_export)
-                        self.call_from_thread(self._toast, "Spreadsheet not found — reset", 4)
-            threading.Thread(target=_verify_sheet, daemon=True).start()
+        return tasks, sum(self._task_secs(t, active) for t in tasks)
 
     def _render_export(self) -> None:
-        """Render export view with date, task count, total, and options."""
-        if self._export_connecting:
-            self._render_connect_sheet()
+        """Export view: period picker plus a summary of what would be exported."""
+        if self._export_range_input:
+            self._render_export_range()
             return
-        dt = self._sync_dt
-        date_long = getattr(self, "_sync_date_long", dt.strftime("%A, %B ") + str(dt.day) + dt.strftime(", %Y"))
-        current_month = dt.strftime("%B")
-        sheet_name = f"Tracker {current_month}"
-        n = len(self._sync_tasks)
-        total = self._fmt_time(self._sync_total_secs)
 
-        has_sheet = self._get_sync_spreadsheet_id() is not None
+        tasks, total = self._period_tasks(self._export_period)
+        days = len({t.wall_start.date() for t in tasks})
 
-        rows = []
-        sheet_title = self._get_sync_spreadsheet_title() if has_sheet else None
-        if sheet_title:
-            rows.append(Text.from_markup(f"[{TEXT_COLOR}]{sheet_title}[/]"))
-        else:
-            rows.append(Text.from_markup(
-                f"[bold {self._accent}]Report on Hours[/] [{DIM}]/ Kostiantyn Halynskyi for[/] [{TEXT_COLOR}]{self._project}[/]"
-            ))
+        rows = [Text.from_markup(
+            f"[bold {self._accent}]Report on Hours[/] [{DIM}]/ Kostiantyn Halynskyi for[/]"
+            f" [{TEXT_COLOR}]{self._project}[/]"
+        )]
         rows.append(Text.from_markup(f"[{SEPARATOR}]{'─' * 50}[/]"))
-        rows.append(Text.from_markup(f"[{DIM}]Date:[/]    [{TEXT_COLOR}]{date_long}[/]"))
-        rows.append(Text.from_markup(f"[{DIM}]Tasks:[/]   [{TEXT_COLOR}]{n}[/]"))
-        rows.append(Text.from_markup(f"[{DIM}]Total:[/]   [{TEXT_COLOR}]{total}[/]"))
-        if has_sheet:
-            rows.append(Text.from_markup(f"[{DIM}]Sheet:[/]   [{self._accent}]{sheet_name}[/]"))
-        else:
-            rows.append(Text.from_markup(f"[{DIM}]Sheet:[/]   [{DIM}]not created yet[/]"))
-        rows.append(Text.from_markup(f"[{SEPARATOR}]{'─' * 50}[/]"))
-        if has_sheet:
-            rows.append(Text.from_markup(
-                f"[bold {self._accent}]1.[/] [{TEXT_COLOR}]Sync to Google Sheets[/]"
-            ))
-            rows.append(Text.from_markup(f"[{SEPARATOR}]{'─' * 50}[/]"))
-            rows.append(Text.from_markup(
-                f"[bold {self._accent}]2.[/] [{TEXT_COLOR}]Connect Existing Spreadsheet[/]"
-            ))
-            rows.append(Text.from_markup(f"[{SEPARATOR}]{'─' * 50}[/]"))
-            rows.append(Text.from_markup(
-                f"[bold {self._accent}]3.[/] [{TEXT_COLOR}]Clear from Google Sheets[/]"
-            ))
-            rows.append(Text.from_markup(f"[{SEPARATOR}]{'─' * 50}[/]"))
-            rows.append(Text.from_markup(
-                f"[bold {self._accent}]4.[/] [{TEXT_COLOR}]Export to Excel (.xlsx)[/]"
-            ))
-            rows.append(Text.from_markup(f"[{SEPARATOR}]{'─' * 50}[/]"))
-            rows.append(Text.from_markup(
-                f"[bold {self._accent}]5.[/] [{TEXT_COLOR}]Open in Browser[/]"
-            ))
-        else:
-            rows.append(Text.from_markup(
-                f"[bold {self._accent}]1.[/] [{TEXT_COLOR}]Create Spreadsheet & Sync[/]"
-            ))
-            rows.append(Text.from_markup(f"[{SEPARATOR}]{'─' * 50}[/]"))
-            rows.append(Text.from_markup(
-                f"[bold {self._accent}]2.[/] [{TEXT_COLOR}]Connect Existing Spreadsheet[/]"
-            ))
-            rows.append(Text.from_markup(f"[{SEPARATOR}]{'─' * 50}[/]"))
-            rows.append(Text.from_markup(
-                f"[bold {self._accent}]3.[/] [{TEXT_COLOR}]Export to Excel (.xlsx)[/]"
-            ))
+        rows.append(Text.from_markup(
+            f"[{DIM}]Period:[/]  [{TEXT_COLOR}]{self._period_label(self._export_period)}[/]"
+        ))
+        rows.append(Text.from_markup(f"[{DIM}]Days:[/]    [{TEXT_COLOR}]{days}[/]"))
+        rows.append(Text.from_markup(f"[{DIM}]Tasks:[/]   [{TEXT_COLOR}]{len(tasks)}[/]"))
+        rows.append(Text.from_markup(
+            f"[{DIM}]Total:[/]   [{TEXT_COLOR}]{self._fmt_time(total)}[/]"
+            f"  [{DIM}]({total / 3600:.2f} h)[/]"
+        ))
 
+        for i, (key, label) in enumerate(self._EXPORT_PERIODS, 1):
+            rows.append(Text.from_markup(f"[{SEPARATOR}]{'─' * 50}[/]"))
+            marker = f" [{self._accent}]•[/]" if key == self._export_period else ""
+            left = f"[bold {self._accent}]{i}.[/] [{TEXT_COLOR}]{label}[/]{marker}"
+            if key == "range":
+                rows.append(Text.from_markup(left))
+            else:
+                _, secs = self._period_tasks(key)
+                right = f"[{TEXT_COLOR}]{self._fmt_time(secs)}[/]" if secs else f"[{DIM}]—[/]"
+                rows.append(self._space_between(left, right))
+
+        rows.append(Text.from_markup(f"[{SEPARATOR}]{'─' * 50}[/]"))
+        rows.append(Text.from_markup(
+            f"[bold {self._accent}]5.[/] [{TEXT_COLOR}]Visual report (.html)[/]"
+        ))
+        rows.append(Text.from_markup(f"[{SEPARATOR}]{'─' * 50}[/]"))
+        rows.append(Text.from_markup(
+            f"[bold {self._accent}]6.[/] [{TEXT_COLOR}]Export to Excel (.xlsx)[/]"
+        ))
+        self.query_one("#history", Static).update(Group(*rows))
+
+    def _render_export_range(self) -> None:
+        rows = [
+            Text(""),
+            Text.from_markup(f"[bold {self._accent}]Custom range[/]"),
+            Text(""),
+            Text.from_markup(
+                f"[{DIM}]Two dates:[/] [{TEXT_COLOR}]2026-07-01 2026-07-15[/]"
+            ),
+            Text.from_markup(f"[{DIM}]One date exports that single day.[/]"),
+            Text(""),
+            Text.from_markup(f"[{DIM}]/back to cancel[/]"),
+        ]
         self.query_one("#history", Static).update(Group(*rows))
 
     def _select_export(self, raw: str) -> None:
-        """Handle export view selection.
-        With sheet: 1=sync, 2=connect, 3=clear, 4=xlsx, 5=open.
-        Without:    1=create&sync, 2=connect, 3=xlsx.
-        """
-        has_sheet = self._get_sync_spreadsheet_id() is not None
-
-        # Connect mode: user is pasting a URL
-        if getattr(self, "_export_connecting", False):
-            self._export_connecting = False
-            self._connect_spreadsheet_url(raw)
+        if self._export_range_input:
+            self._apply_export_range(raw)
             return
-
-        # Connect Existing Spreadsheet — "2" in both modes
-        if raw == "2":
-            self._export_connecting = True
-            self._render_connect_sheet()
-            inp = self.query_one("#task-input", HistoryInput)
-            inp.placeholder = "  Paste URL here \u2022 /back to cancel"
-            return
-
-        # Map to unified actions based on mode
-        if has_sheet:
-            # 1=sync, 3=clear, 4=xlsx, 5=open
-            action = {"1": "sync", "3": "clear", "4": "xlsx", "5": "open"}.get(raw)
-        else:
-            # 1=create&sync, 3=xlsx
-            action = {"1": "sync", "3": "xlsx"}.get(raw)
-
-        if not action:
-            return
-
-        if action in ("sync", "clear"):
-            token_path = STATE_DIR / "oauth_token.json"
-            client_secret_path = STATE_DIR / "client_secret.json"
-            if not token_path.exists() and not client_secret_path.exists():
-                self._toast("client_secret.json not found in ~/.timex/", 5)
+        if raw in ("1", "2", "3", "4"):
+            key = self._EXPORT_PERIODS[int(raw) - 1][0]
+            if key == "range":
+                self._export_range_input = True
+                self._enter_view("export", "  e.g. 2026-07-01 2026-07-15")
                 return
-            try:
-                _sys_sp = "/Library/Frameworks/Python.framework/Versions/3.13/lib/python3.13/site-packages"
-                if _sys_sp not in sys.path:
-                    sys.path.append(_sys_sp)
-                import gspread  # noqa: F401
-                from google.oauth2.credentials import Credentials  # noqa: F401
-            except ImportError:
-                self._toast("gspread required — pip install gspread google-auth google-auth-oauthlib", 5)
-                return
+            self._export_period = key
+            self._render_export()
+        elif raw == "5":
+            self._export_report()
+        elif raw == "6":
+            self._export_xlsx()
 
-        if action == "sync":
-            self._toast("Syncing...", 10)
-            sync_dt = self._sync_dt
-            task_entries = self._sync_tasks
-            active = self._active_seconds()
-            date_long = self._sync_date_long
-            date_search = self._sync_date_search
-            watch_used = self._sync_watch_used
-            link_dates = list(self._sync_link_dates) if self._sync_link_dates else []
-
-            def _do_sync():
-                gc, creds = self._get_gspread_client()
-
-                # Per-project spreadsheet: open existing or create new
-                ssid = self._get_sync_spreadsheet_id()
-                is_new_spreadsheet = False
-                if ssid:
-                    try:
-                        spreadsheet = gc.open_by_key(ssid)
-                    except Exception:
-                        # Spreadsheet deleted — create new one
-                        ssid = None
-                if not ssid:
-                    title = f"[{self._project}] Report on Hours / Kostiantyn Halynskyi"
-                    spreadsheet = gc.create(title)
-                    ssid = spreadsheet.id
-                    is_new_spreadsheet = True
-                self._save_sync_spreadsheet_id(ssid, spreadsheet.title)
-
-                current_month = sync_dt.strftime("%B")  # e.g. "April"
-
-                # Find "Tracker {Month}" and "Report" sheets (no deletions)
-                # "Report" must start with "report" (not match old "[Apr days report]")
-                tracker_ws = None
-                report_ws = None
-                for ws in spreadsheet.worksheets():
-                    title_lower = ws.title.lower()
-                    if "tracker" in title_lower and current_month.lower() in title_lower:
-                        tracker_ws = ws
-                    elif title_lower == "report" or title_lower.startswith("report ") or title_lower.startswith("report\t"):
-                        report_ws = ws
-
-                if tracker_ws is None or report_ws is None:
-                    missing = []
-                    if report_ws is None:
-                        missing.append("Report")
-                    if tracker_ws is None:
-                        missing.append(f"Tracker {current_month}")
-                    self._confirm_sheets_ctx = {"spreadsheet_id": ssid, "missing": missing, "delete_default": is_new_spreadsheet}
-                    self.call_from_thread(self._enter_confirm_create_sheets, missing)
-                    return
-
-                sheet_id = tracker_ws.id
-
-                all_vals = tracker_ws.get_all_values()
-
-                # Calculate new table size: title + date + gap/warning + header + tasks + total
-                n_tasks = len(task_entries)
-                new_rows = 3 + 1 + n_tasks + 1  # title, date, gap/warning, header, tasks, total
-
-                # Find and clear existing table (inserts/deletes rows if size differs)
-                start_row = self._find_and_clear_table(tracker_ws, spreadsheet, sheet_id, date_long, all_vals,
-                                                       creds=creds, spreadsheet_id=ssid,
-                                                       new_rows=new_rows, alt_date_longs=date_search)
-
-                rows = []
-                rows.append(["\u23f1 Time Report", "", "", "", ""])
-                rows.append([date_long, "", "", "", ""])
-                if watch_used:
-                    rows.append(["", "", "\u26a0\ufe0f Tracker under Test Mode \u26a0\ufe0f", "", ""])
-                else:
-                    rows.append(["", "", "", "", ""])
-                rows.append(["#", "Start", "End", "Task", "Duration"])
-
-                total_secs = 0.0
-                for i, task in enumerate(task_entries, 1):
-                    dur = task.get_duration(active if task.active_end is None else None)
-                    total_secs += dur
-                    end_time = task.wall_end or self._now()
-                    s = int(dur)
-                    h, remainder = divmod(s, 3600)
-                    m, sec = divmod(remainder, 60)
-                    if h > 0:
-                        dur_str = f"{h}h {m:02d}m {sec:02d}s"
-                    elif m > 0:
-                        dur_str = f"{m}m {sec:02d}s"
-                    else:
-                        dur_str = f"{sec}s"
-                    rows.append([
-                        i,
-                        task.wall_start.strftime("%H:%M:%S"),
-                        end_time.strftime("%H:%M:%S"),
-                        task.name,
-                        dur_str,
-                    ])
-
-                rows.append(["", "", "", "TOTAL", self._fmt_time(total_secs)])
-
-                _retry(lambda: tracker_ws.update(f"A{start_row}", rows, value_input_option="RAW"))
-
-                # ── Formatting via batch_update ──
-                r0 = start_row - 1
-                n_tasks = len(task_entries)
-                header_r = r0 + 3
-                data_start = r0 + 4
-                total_r = data_start + n_tasks
-
-                GREEN = {"red": 0.208, "green": 0.408, "blue": 0.329}
-                GRAY = {"red": 0.533, "green": 0.533, "blue": 0.533}
-                WHITE = {"red": 1, "green": 1, "blue": 1}
-                DARK = {"red": 0.263, "green": 0.263, "blue": 0.263}
-                BORDER_GRAY = {"red": 0.867, "green": 0.867, "blue": 0.867}
-                BAND_ALT = {"red": 0.965, "green": 0.973, "blue": 0.976}
-                CALIBRI = "Calibri"
-
-                def _cell_fmt(sr, er, sc, ec, fmt):
-                    return {"repeatCell": {
-                        "range": {"sheetId": sheet_id, "startRowIndex": sr, "endRowIndex": er,
-                                  "startColumnIndex": sc, "endColumnIndex": ec},
-                        "cell": {"userEnteredFormat": fmt},
-                        "fields": "userEnteredFormat(" + ",".join(fmt.keys()) + ")",
-                    }}
-
-                requests = [
-                    {"mergeCells": {"range": {"sheetId": sheet_id, "startRowIndex": r0, "endRowIndex": r0 + 1,
-                        "startColumnIndex": 0, "endColumnIndex": 5}, "mergeType": "MERGE_ALL"}},
-                    {"mergeCells": {"range": {"sheetId": sheet_id, "startRowIndex": r0 + 1, "endRowIndex": r0 + 2,
-                        "startColumnIndex": 0, "endColumnIndex": 5}, "mergeType": "MERGE_ALL"}},
-                    # Title row: 42px height, bottom-aligned, white bottom border
-                    {"updateDimensionProperties": {
-                        "range": {"sheetId": sheet_id, "dimension": "ROWS",
-                                  "startIndex": r0, "endIndex": r0 + 1},
-                        "properties": {"pixelSize": 42}, "fields": "pixelSize"}},
-                    _cell_fmt(r0, r0 + 1, 0, 5, {
-                        "textFormat": {"fontFamily": CALIBRI, "fontSize": 14, "bold": True},
-                        "verticalAlignment": "BOTTOM",
-                        "borders": {"bottom": {"style": "SOLID", "width": 1,
-                                               "colorStyle": {"rgbColor": WHITE}}},
-                    }),
-                    # Date row: 42px height, top-aligned
-                    {"updateDimensionProperties": {
-                        "range": {"sheetId": sheet_id, "dimension": "ROWS",
-                                  "startIndex": r0 + 1, "endIndex": r0 + 2},
-                        "properties": {"pixelSize": 42}, "fields": "pixelSize"}},
-                    _cell_fmt(r0 + 1, r0 + 2, 0, 5, {
-                        "textFormat": {"fontFamily": CALIBRI, "fontSize": 12,
-                                       "foregroundColorStyle": {"rgbColor": GRAY}},
-                        "verticalAlignment": "TOP",
-                    }),
-                ] + ([
-                    # Warning row: merge C:E, 29px, left-aligned, vertical middle, white left border
-                    {"mergeCells": {"range": {"sheetId": sheet_id, "startRowIndex": r0 + 2, "endRowIndex": r0 + 3,
-                        "startColumnIndex": 2, "endColumnIndex": 5}, "mergeType": "MERGE_ALL"}},
-                    {"updateDimensionProperties": {
-                        "range": {"sheetId": sheet_id, "dimension": "ROWS",
-                                  "startIndex": r0 + 2, "endIndex": r0 + 3},
-                        "properties": {"pixelSize": 29}, "fields": "pixelSize"}},
-                    _cell_fmt(r0 + 2, r0 + 3, 2, 5, {
-                        "verticalAlignment": "MIDDLE",
-                        "borders": {"left": {"style": "SOLID", "width": 1,
-                                             "colorStyle": {"rgbColor": WHITE}}},
-                    }),
-                ] if watch_used else []) + [
-                    # Header row: green bg, white bold, center, clip
-                    _cell_fmt(header_r, header_r + 1, 0, 5, {
-                        "backgroundColor": GREEN,
-                        "textFormat": {"fontFamily": CALIBRI, "fontSize": 11, "bold": True,
-                                       "foregroundColorStyle": {"rgbColor": WHITE}},
-                        "horizontalAlignment": "CENTER",
-                        "wrapStrategy": "CLIP",
-                    }),
-                    # Data rows: Calibri 11pt, default text, bottom border, clip
-                    _cell_fmt(data_start, total_r, 0, 5, {
-                        "textFormat": {"fontFamily": CALIBRI, "fontSize": 11},
-                        "borders": {"bottom": {"style": "SOLID", "width": 1,
-                                               "colorStyle": {"rgbColor": BORDER_GRAY}}},
-                        "wrapStrategy": "CLIP",
-                    }),
-                    # Col A (#): right-aligned
-                    _cell_fmt(data_start, total_r, 0, 1, {
-                        "horizontalAlignment": "RIGHT",
-                    }),
-                    # Col D (Task): wrap text
-                    _cell_fmt(data_start, total_r, 3, 4, {
-                        "wrapStrategy": "WRAP",
-                    }),
-                    # TOTAL row: bold, alternating bg, clip
-                    _cell_fmt(total_r, total_r + 1, 0, 5, {
-                        "textFormat": {"fontFamily": CALIBRI, "fontSize": 11, "bold": True},
-                        "backgroundColor": BAND_ALT,
-                        "wrapStrategy": "CLIP",
-                    }),
-                ]
-
-                # Row heights: 29px min, expand for multi-line tasks
-                # Col D ~444px, Calibri 11 ~7px/char → ~60 chars/line
-                import math
-                requests.append({"updateDimensionProperties": {
-                    "range": {"sheetId": sheet_id, "dimension": "ROWS",
-                              "startIndex": header_r, "endIndex": header_r + 1},
-                    "properties": {"pixelSize": 29}, "fields": "pixelSize"}})
-                for i in range(n_tasks):
-                    row_idx = data_start + i
-                    name_len = len(task_entries[i].name)
-                    lines = math.ceil(name_len / 60) if name_len > 0 else 1
-                    px = max(29, lines * 20 + 9)
-                    requests.append({"updateDimensionProperties": {
-                        "range": {"sheetId": sheet_id, "dimension": "ROWS",
-                                  "startIndex": row_idx, "endIndex": row_idx + 1},
-                        "properties": {"pixelSize": px}, "fields": "pixelSize"}})
-                requests.append({"updateDimensionProperties": {
-                    "range": {"sheetId": sheet_id, "dimension": "ROWS",
-                              "startIndex": total_r, "endIndex": total_r + 1},
-                    "properties": {"pixelSize": 29}, "fields": "pixelSize"}})
-
-                # Alternating row colors
-                for i in range(n_tasks):
-                    row_idx = data_start + i
-                    bg = BAND_ALT if i % 2 == 1 else WHITE
-                    requests.append(_cell_fmt(row_idx, row_idx + 1, 0, 5, {
-                        "backgroundColor": bg,
-                    }))
-
-                _retry(lambda: spreadsheet.batch_update({"requests": requests}))
-
-                # ── Convert to native Google Sheets Table ──
-                table_name = f"Table{sync_dt.day}"
+    def _apply_export_range(self, raw: str) -> None:
+        parsed: list[date] = []
+        for part in raw.replace(",", " ").split():
+            for fmt in ("%Y-%m-%d", "%d.%m.%Y", "%d.%m"):
                 try:
-                    spreadsheet.batch_update({"requests": [{
-                        "addTable": {
-                            "table": {
-                                "name": table_name,
-                                "range": {
-                                    "sheetId": sheet_id,
-                                    "startRowIndex": header_r,
-                                    "endRowIndex": total_r + 1,
-                                    "startColumnIndex": 0,
-                                    "endColumnIndex": 5,
-                                },
-                            },
-                        },
-                    }]})
-                except Exception:
-                    pass  # Table creation is cosmetic; don't fail sync
-
-                # ── Re-apply WRAP on col D after table creation ──
-                spreadsheet.batch_update({"requests": [
-                    {"repeatCell": {
-                        "range": {"sheetId": sheet_id, "startRowIndex": data_start,
-                                  "endRowIndex": total_r, "startColumnIndex": 3, "endColumnIndex": 4},
-                        "cell": {"userEnteredFormat": {"wrapStrategy": "WRAP"}},
-                        "fields": "userEnteredFormat(wrapStrategy)",
-                    }}
-                ]})
-
-                # ── Update link in Report sheet (column E next to today's date) ──
-                link_written = False
-                try:
-                    link_url = f"https://docs.google.com/spreadsheets/d/{ssid}/edit#gid={sheet_id}&range=A{start_row}"
-                    report_vals = report_ws.col_values(1)
-                    report_id = report_ws.id
-                    link_requests = []
-                    for d in link_dates:
-                        date_key = d.strftime("%d.%m.%Y")
-                        for ri, cell_val in enumerate(report_vals):
-                            if cell_val.strip() == date_key:
-                                link_requests.append({
-                                    "updateCells": {
-                                        "range": {
-                                            "sheetId": report_id,
-                                            "startRowIndex": ri,
-                                            "endRowIndex": ri + 1,
-                                            "startColumnIndex": 4,
-                                            "endColumnIndex": 5,
-                                        },
-                                        "rows": [{"values": [{
-                                            "userEnteredValue": {"stringValue": "\u2192 View"},
-                                            "userEnteredFormat": {
-                                                "horizontalAlignment": "CENTER",
-                                                "verticalAlignment": "MIDDLE",
-                                                "textFormat": {
-                                                    "fontSize": 11,
-                                                    "link": {"uri": link_url},
-                                                },
-                                                "hyperlinkDisplayType": "LINKED",
-                                            },
-                                        }]}],
-                                        "fields": "userEnteredValue,userEnteredFormat(horizontalAlignment,verticalAlignment,textFormat,hyperlinkDisplayType)",
-                                    },
-                                })
-                                link_written = True
-                                break
-                    if link_requests:
-                        spreadsheet.batch_update({"requests": link_requests})
-                except Exception as _link_err:
-                    try:
-                        with open(CRASH_LOG, "a") as _f:
-                            _f.write(f"[report_link] {type(_link_err).__name__}: {_link_err}\n")
-                    except OSError:
-                        pass
-
-                n = len(task_entries)
-                total_fmt = self._fmt_time(total_secs)
-                if len(link_dates) > 1:
-                    date_short = (link_dates[0].strftime("%d.%m") + "\u2013" +
-                                  link_dates[-1].strftime("%d.%m"))
-                else:
-                    date_short = sync_dt.strftime("%d.%m")
-                suffix = " + Report link" if link_written else ""
-                self.call_from_thread(self._leave_view, f"Synced {date_short} \u2014 {n} tasks, {total_fmt}{suffix}")
-
-            def _sync_thread():
-                try:
-                    _do_sync()
-                except Exception as e:
-                    self.call_from_thread(self._toast, f"Sync error: {e}", 6)
-
-            threading.Thread(target=_sync_thread, daemon=True).start()
-
-        elif action == "clear":
-            self._toast("Clearing...", 10)
-            sync_dt = self._sync_dt
-            clear_date_long = self._sync_date_long
-            clear_date_search = self._sync_date_search
-
-            def _do_sync_clear():
-                ssid = self._get_sync_spreadsheet_id()
-                if not ssid:
-                    self.call_from_thread(self._toast, "No spreadsheet configured for this project")
-                    return
-
-                gc, creds = self._get_gspread_client()
-                spreadsheet = gc.open_by_key(ssid)
-
-                current_month = sync_dt.strftime("%B")  # e.g. "April"
-                days_sheet = None
-                for ws in spreadsheet.worksheets():
-                    if "tracker" in ws.title.lower() and current_month.lower() in ws.title.lower():
-                        days_sheet = ws
-                        break
-                if days_sheet is None:
-                    self.call_from_thread(self._toast, f"No 'Tracker {current_month}' sheet found")
-                    return
-                sheet_id = days_sheet.id
-
-                all_vals = days_sheet.get_all_values()
-
-                # Find existing table
-                search_terms = {clear_date_long}
-                if clear_date_search:
-                    search_terms.update(clear_date_search)
-                existing_row = None
-                for i, row in enumerate(all_vals):
-                    if row and row[0] in search_terms:
-                        existing_row = i + 1
-                        break
-
-                if existing_row is None:
-                    date_short = sync_dt.strftime("%d.%m")
-                    self.call_from_thread(self._toast, f"No data for {date_short} in sheet")
-                    return
-
-                # Clear the table
-                title_row = existing_row
-                if existing_row >= 2 and all_vals[existing_row - 2][0] == "\u23f1 Time Report":
-                    title_row = existing_row - 1
-                old_end = existing_row
-                for i in range(existing_row, len(all_vals)):
-                    cell_a = all_vals[i][0] if all_vals[i] else ""
-                    if i > existing_row and cell_a == "\u23f1 Time Report":
-                        break
-                    if any(all_vals[i]):
-                        old_end = i + 1
-
-                # Delete native Table if present
-                self._delete_native_table(creds, ssid, sheet_id, title_row - 1, old_end)
-
-                clear_rows = old_end - title_row + 1
-                empty = [["", "", "", "", ""]] * clear_rows
-                _retry(lambda: days_sheet.update(f"A{title_row}", empty, value_input_option="RAW"))
-                r0 = title_row - 1
-                r1 = r0 + clear_rows
-                spreadsheet.batch_update({"requests": [
-                    # Unmerge title/date rows
-                    {"unmergeCells": {"range": {"sheetId": sheet_id,
-                        "startRowIndex": r0, "endRowIndex": r0 + 2,
-                        "startColumnIndex": 0, "endColumnIndex": 5}}},
-                    # Reset all formatting (bg, font, borders, alignment)
-                    {"repeatCell": {
-                        "range": {"sheetId": sheet_id,
-                                  "startRowIndex": r0, "endRowIndex": r1,
-                                  "startColumnIndex": 0, "endColumnIndex": 5},
-                        "cell": {"userEnteredFormat": {}},
-                        "fields": "userEnteredFormat",
-                    }},
-                    # Reset row heights to default
-                ] + [
-                    {"updateDimensionProperties": {
-                        "range": {"sheetId": sheet_id, "dimension": "ROWS",
-                                  "startIndex": r0 + i, "endIndex": r0 + i + 1},
-                        "properties": {"pixelSize": 21},
-                        "fields": "pixelSize",
-                    }} for i in range(clear_rows)
-                ]})
-
-                date_short = sync_dt.strftime("%d.%m")
-                self.call_from_thread(self._leave_view, f"Cleared {date_short}")
-
-            def _clear_thread():
-                try:
-                    _do_sync_clear()
-                except Exception as e:
-                    self.call_from_thread(self._toast, f"Clear error: {e}", 6)
-
-            threading.Thread(target=_clear_thread, daemon=True).start()
-
-        elif action == "xlsx":
-            # ── Export to Excel (.xlsx) ──
-            try:
-                from openpyxl import Workbook
-                from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
-            except ImportError:
-                self._toast("openpyxl required — pip install openpyxl", 5)
-                return
-
-            active = self._active_seconds()
-            export_tasks = self._sync_tasks
-
-            wb = Workbook()
-            ws = wb.active
-            ws.title = "Time Report"
-
-            amber_fill = PatternFill(start_color=self._accent_hex, end_color=self._accent_hex, fill_type="solid")
-            header_font = Font(bold=True, color="FFFFFF", size=11)
-            bold_font = Font(bold=True, size=11)
-            thin_border = Border(bottom=Side(style="thin", color="DDDDDD"))
-
-            ws.merge_cells("A1:E1")
-            ws.cell(row=1, column=1, value="\u23f1 Time Report").font = Font(bold=True, size=14)
-
-            date_str = self._sync_date_long
-            ws.merge_cells("A2:E2")
-            ws.cell(row=2, column=1, value=date_str).font = Font(color="888888", size=10)
-
-            for col, h in enumerate(["#", "Start", "End", "Task", "Duration"], 1):
-                cell = ws.cell(row=4, column=col, value=h)
-                cell.font = header_font
-                cell.fill = amber_fill
-                cell.alignment = Alignment(horizontal="center")
-
-            total_secs = 0.0
-            for i, task in enumerate(export_tasks, 1):
-                row = i + 4
-                dur = task.get_duration(active if task.active_end is None else None)
-                total_secs += dur
-                end_time = task.wall_end or self._now()
-                ws.cell(row=row, column=1, value=i).alignment = Alignment(horizontal="center")
-                ws.cell(row=row, column=2, value=task.wall_start.strftime("%H:%M:%S"))
-                ws.cell(row=row, column=3, value=end_time.strftime("%H:%M:%S"))
-                ws.cell(row=row, column=4, value=task.name)
-                ws.cell(row=row, column=5, value=task.format_duration(
-                    active if task.active_end is None else None
-                ))
-                for c in range(1, 6):
-                    ws.cell(row=row, column=c).border = thin_border
-
-            total_row = len(export_tasks) + 5
-            ws.cell(row=total_row, column=4, value="TOTAL").font = bold_font
-            ws.cell(row=total_row, column=5, value=self._fmt_time(total_secs)).font = bold_font
-
-            for col_letter, width in {"A": 6, "B": 12, "C": 12, "D": 40, "E": 14}.items():
-                ws.column_dimensions[col_letter].width = width
-
-            downloads = Path.home() / "Downloads"
-            downloads.mkdir(exist_ok=True)
-            filename = f"halynskyi_{self._sync_dt.strftime('%Y%m%d_%H%M%S')}.xlsx"
-            filepath = downloads / filename
-            wb.save(str(filepath))
-
-            self._leave_view(f"Saved \u2192 ~/Downloads/{filename}")
-
-        elif action == "open":
-            ssid = self._get_sync_spreadsheet_id()
-            if ssid:
-                import webbrowser
-                webbrowser.open(f"https://docs.google.com/spreadsheets/d/{ssid}")
-                self._toast("Opened in browser")
-            else:
-                self._toast("No spreadsheet yet")
-
-    @staticmethod
-    def _delete_native_table(creds, spreadsheet_id, sheet_id, start_row_idx, end_row_idx):
-        """Delete native Google Sheets Table overlapping the given row range."""
-        try:
-            from google.auth.transport.requests import Request as AuthRequest
-            import requests as req
-            creds.refresh(AuthRequest())
-            url = f"https://sheets.googleapis.com/v4/spreadsheets/{spreadsheet_id}?fields=sheets.tables"
-            r = req.get(url, headers={"Authorization": f"Bearer {creds.token}"})
-            if r.status_code != 200:
-                return
-            for sheet in r.json().get("sheets", []):
-                for t in sheet.get("tables", []):
-                    tr = t.get("range", {})
-                    if tr.get("sheetId") == sheet_id and tr.get("startRowIndex", -1) >= start_row_idx and tr.get("endRowIndex", -1) <= end_row_idx:
-                        from gspread import Client
-                        # Use the spreadsheet's batch_update directly
-                        import json
-                        body = {"requests": [{"deleteTable": {"tableId": t["tableId"]}}]}
-                        req.post(
-                            f"https://sheets.googleapis.com/v4/spreadsheets/{spreadsheet_id}:batchUpdate",
-                            headers={"Authorization": f"Bearer {creds.token}", "Content-Type": "application/json"},
-                            data=json.dumps(body),
-                        )
-        except Exception:
-            pass
-
-    @staticmethod
-    def _find_and_clear_table(days_sheet, spreadsheet, sheet_id, date_long, all_vals,
-                              creds=None, spreadsheet_id=None, new_rows=0, alt_date_longs=None):
-        """Find existing table by date, clear it, insert/delete rows if needed, return start_row."""
-        search_terms = {date_long}
-        if alt_date_longs:
-            search_terms.update(alt_date_longs)
-        existing_row = None
-        for i, row in enumerate(all_vals):
-            if row and row[0] in search_terms:
-                existing_row = i + 1
-                break
-
-        if existing_row is not None:
-            # ── Existing table: clear and resize ──
-            title_row = existing_row
-            if existing_row >= 2 and all_vals[existing_row - 2][0] == "\u23f1 Time Report":
-                title_row = existing_row - 1
-            old_end = existing_row
-            for i in range(existing_row, len(all_vals)):
-                cell_a = all_vals[i][0] if all_vals[i] else ""
-                if i > existing_row and cell_a == "\u23f1 Time Report":
-                    break
-                if any(all_vals[i]):
-                    old_end = i + 1
-
-            # Delete native Table if present
-            if creds and spreadsheet_id:
-                TimexApp._delete_native_table(creds, spreadsheet_id, sheet_id, title_row - 1, old_end)
-
-            old_rows = old_end - title_row + 1
-
-            # Insert or delete rows to match new_rows
-            if new_rows > 0 and new_rows != old_rows:
-                diff = new_rows - old_rows
-                if diff > 0:
-                    # Insert rows at end of old table to push everything down
-                    spreadsheet.batch_update({"requests": [{
-                        "insertDimension": {
-                            "range": {"sheetId": sheet_id, "dimension": "ROWS",
-                                      "startIndex": old_end, "endIndex": old_end + diff},
-                            "inheritFromBefore": False,
-                        }
-                    }]})
-                elif diff < 0:
-                    # Delete excess rows from end of old table
-                    spreadsheet.batch_update({"requests": [{
-                        "deleteDimension": {
-                            "range": {"sheetId": sheet_id, "dimension": "ROWS",
-                                      "startIndex": old_end + diff, "endIndex": old_end},
-                        }
-                    }]})
-
-            # Clear values and formatting
-            clear_rows = max(old_rows, new_rows) if new_rows > 0 else old_rows
-            empty = [["", "", "", "", ""]] * clear_rows
-            days_sheet.update(f"A{title_row}", empty, value_input_option="RAW")
-            r0 = title_row - 1
-            r1 = r0 + clear_rows
-            spreadsheet.batch_update({"requests": [
-                {"unmergeCells": {"range": {"sheetId": sheet_id,
-                    "startRowIndex": r0, "endRowIndex": r0 + 2,
-                    "startColumnIndex": 0, "endColumnIndex": 5}}},
-                {"repeatCell": {
-                    "range": {"sheetId": sheet_id,
-                              "startRowIndex": r0, "endRowIndex": r1,
-                              "startColumnIndex": 0, "endColumnIndex": 5},
-                    "cell": {"userEnteredFormat": {}},
-                    "fields": "userEnteredFormat",
-                }},
-            ] + [
-                {"updateDimensionProperties": {
-                    "range": {"sheetId": sheet_id, "dimension": "ROWS",
-                              "startIndex": r0 + i, "endIndex": r0 + i + 1},
-                    "properties": {"pixelSize": 21},
-                    "fields": "pixelSize",
-                }} for i in range(clear_rows)
-            ]})
-            return title_row
-        else:
-            # ── No existing table: find insertion point ──
-            # Look for the right position by date order (tables are chronological)
-            # Each table starts with "⏱ Time Report" followed by date string
-            from datetime import datetime as _dt
-
-            def _parse_date(s):
-                """Parse date string like 'Friday, March 7, 2026' or range 'Friday, March 22 – ..., 2026'."""
-                try:
-                    if " \u2013 " in s:
-                        parts = s.split(" \u2013 ")
-                        year = parts[1].strip().rsplit(", ", 1)[-1]
-                        return _dt.strptime(parts[0].strip() + ", " + year, "%A, %B %d, %Y")
-                    return _dt.strptime(s.strip(), "%A, %B %d, %Y")
+                    d = datetime.strptime(part, fmt).date()
                 except ValueError:
-                    return None
+                    continue
+                if fmt == "%d.%m":
+                    d = d.replace(year=self._now().year)
+                parsed.append(d)
+                break
+        if not parsed or len(parsed) > 2:
+            self._toast("Use: 2026-07-01 2026-07-15", 4)
+            return
+        self._export_range = (min(parsed), max(parsed))
+        self._export_period = "range"
+        self._export_range_input = False
+        self._enter_view("export", "  select option • /back")
 
-            target_dt = _parse_date(date_long)
+    def _export_gather(self) -> tuple | None:
+        """(from, to, tasks, durations, total) for the chosen period, or None."""
+        d_from, d_to = self._period_bounds(self._export_period)
+        tasks = self._collect_tasks(d_from, d_to)
+        if not tasks:
+            self._toast("Nothing to export for this period")
+            return None
+        active = self._active_seconds()
+        durations = [self._task_secs(t, active) for t in tasks]
+        return d_from, d_to, tasks, durations, sum(durations)
 
-            insert_before = None  # 1-based row to insert before
-            if target_dt:
-                i = 0
-                while i < len(all_vals):
-                    row = all_vals[i]
-                    if row and row[0] == "\u23f1 Time Report" and i + 1 < len(all_vals):
-                        table_dt = _parse_date(all_vals[i + 1][0])
-                        if table_dt and table_dt > target_dt:
-                            insert_before = i + 1  # 1-based
-                            break
-                    i += 1
+    def _export_filename(self, d_from: date, d_to: date, ext: str) -> str:
+        stamp = (d_from.strftime("%Y%m%d") if d_from == d_to
+                 else f"{d_from.strftime('%Y%m%d')}-{d_to.strftime('%Y%m%d')}")
+        slug = re.sub(r"[^a-z0-9]+", "_", (self._project or "timex").lower()).strip("_")
+        return f"halynskyi_{slug}_{stamp}.{ext}"
 
-            if insert_before is not None:
-                # Insert new_rows + 2 (gap) rows before this table
-                total_insert = (new_rows if new_rows > 0 else 6) + 2
-                spreadsheet.batch_update({"requests": [{
-                    "insertDimension": {
-                        "range": {"sheetId": sheet_id, "dimension": "ROWS",
-                                  "startIndex": insert_before - 1,
-                                  "endIndex": insert_before - 1 + total_insert},
-                        "inheritFromBefore": False,
-                    }
-                }]})
-                return insert_before  # write starts here
-            else:
-                # Append at the end
-                last_row = len(all_vals)
-                while last_row > 0 and not any(all_vals[last_row - 1]):
-                    last_row -= 1
-                if last_row == 0:
-                    return 1  # Empty sheet — start at A1
-                return last_row + 3
+    def _top_tasks(self, tasks, durations, total, limit: int) -> list[tuple]:
+        """(name, seconds, share) for the biggest tasks, largest first.
+
+        Task names are near-unique, so there is nothing to fold a tail into: an
+        "Other" bucket would swallow ~80% of a month and say nothing. These are
+        the biggest single tasks, not a breakdown of the whole.
+        """
+        agg: dict[str, float] = {}
+        for t, secs in zip(tasks, durations):
+            agg[t.name] = agg.get(t.name, 0.0) + secs
+        ranked = sorted(agg.items(), key=lambda kv: kv[1], reverse=True)[:limit]
+        return [(n, s, (s / total if total else 0.0)) for n, s in ranked]
+
+    def _export_by_day(self, tasks, durations, d_from: date, d_to: date) -> list[tuple]:
+        """(date, seconds) for every calendar day in the period, gaps included."""
+        acc: dict[date, float] = {}
+        for t, secs in zip(tasks, durations):
+            d = t.wall_start.date()
+            acc[d] = acc.get(d, 0.0) + secs
+        out, d = [], d_from
+        while d <= d_to:
+            out.append((d, acc.get(d, 0.0)))
+            d += timedelta(days=1)
+        return out
+
+    def _export_xlsx(self) -> None:
+        """Write the .xlsx report for the selected period into ~/Downloads."""
+        got = self._export_gather()
+        if not got:
+            return
+        try:
+            wb = self._build_workbook(*got)
+        except ImportError:
+            self._toast("openpyxl required — pip install openpyxl", 5)
+            return
+        path = Path.home() / "Downloads" / self._export_filename(got[0], got[1], "xlsx")
+        path.parent.mkdir(exist_ok=True)
+        wb.save(str(path))
+        self._leave_view(f"Saved → ~/Downloads/{path.name}")
+
+    # Light is the base and dark is the override, so a client who never touched
+    # their OS settings gets the readable one. Both palettes are validated against
+    _REPORT_CSS = """
+:root{
+ --surface:#fcfcfb;--panel:#fff;--line:#e7e7e3;--hair:#f0f0ec;
+ --ink:#14140f;--ink2:#5c5c55;
+ --s1:#b87400;--onS1:#fff;--ctx:#e7e7e3;--tipbg:#14140f;--tipink:#fcfcfb;
+ color-scheme:light}
+@media (prefers-color-scheme:dark){:root{
+ --surface:#171717;--panel:#1e1e1e;--line:#2c2c2c;--hair:#242424;
+ --ink:#e8e8e6;--ink2:#a3a39d;
+ --s1:#c98500;--onS1:#171717;--ctx:#2c2c2c;--tipbg:#000;--tipink:#e8e8e6;
+ color-scheme:dark}}
+*{box-sizing:border-box;margin:0;padding:0}
+body{background:var(--surface);color:var(--ink);-webkit-font-smoothing:antialiased;
+ font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Inter,Roboto,"Helvetica Neue",Arial,sans-serif;
+ font-size:16px;line-height:1.6;padding:48px 24px 96px}
+.num{font-variant-numeric:tabular-nums;font-feature-settings:"tnum" 1}
+.wrap{max-width:1000px;margin:0 auto}
+.brand{color:var(--ink2);font-size:14px;font-weight:600;letter-spacing:.04em}
+h1{font-size:34px;font-weight:700;margin:2px 0 1px;letter-spacing:-.02em;line-height:1.15}
+.sub{color:var(--ink2);font-size:16px;line-height:1.4}
+.rule{height:1px;background:var(--line);margin:36px 0}
+h2{font-size:20px;font-weight:650;margin-bottom:0;letter-spacing:-.01em;line-height:1.3}
+.note{color:var(--ink2);font-size:14px;line-height:1.45;margin-bottom:26px}
+.tiles{display:grid;grid-template-columns:repeat(3,1fr);gap:12px}
+@media (max-width:720px){.tiles{grid-template-columns:repeat(2,1fr)}}
+@media (max-width:440px){.tiles{grid-template-columns:1fr}}
+.tile{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:20px 18px}
+.tile .k{color:var(--ink2);font-size:14px;line-height:1.35}
+.tile .v{font-size:26px;font-weight:650;margin-top:6px;white-space:nowrap;
+ letter-spacing:-.02em;line-height:1.2}
+.tile .n{color:var(--ink2);font-size:14px;margin-top:5px;line-height:1.35}
+.tile.hero .v{font-size:34px;color:var(--s1)}
+.tt{list-style:none}
+.tt li{padding:11px 0;border-bottom:1px solid var(--hair);opacity:0;transform:translateY(4px);
+ transition:opacity .4s ease,transform .4s ease}
+.tt li.in{opacity:1;transform:none}
+.tth{display:flex;gap:16px;align-items:baseline;margin-bottom:7px}
+.ttn{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.ttv{color:var(--ink2);font-size:15px;white-space:nowrap}
+.ttv b{color:var(--ink);font-weight:600;margin-left:10px}
+.ttb{height:10px;background:var(--hair);border-radius:5px;overflow:hidden}
+.ttb i{display:block;width:0;height:100%;background:var(--s1);border-radius:5px;
+ transition:width .8s cubic-bezier(.22,1,.36,1)}
+.chart{position:relative;padding-top:22px}
+.peak{position:absolute;top:0;left:0;right:0;border-top:1px dashed var(--line);
+ color:var(--ink2);font-size:13px;padding-bottom:3px}
+.bars{display:flex;align-items:flex-end;gap:5px;height:184px;border-bottom:1px solid var(--line)}
+.bar{flex:1;min-width:0;display:flex;flex-direction:column;justify-content:flex-end;height:100%}
+.bar i{display:block;height:0;background:var(--s1);border-radius:4px 4px 0 0;
+ transition:height .7s cubic-bezier(.22,1,.36,1)}
+.bar.ctx i{background:var(--ctx)}
+.bar.zero i{background:var(--hair)}
+.bar:hover i{filter:brightness(1.15)}
+.xaxis{display:flex;gap:5px;margin-top:10px;color:var(--ink2);font-size:13px}
+.xaxis span{flex:1;min-width:0;text-align:center;white-space:nowrap;overflow:hidden}
+.xaxis span.on{color:var(--ink);font-weight:600}
+table{width:100%;border-collapse:collapse;font-size:16px}
+th,td{padding-right:18px;white-space:nowrap}
+th:last-child,td:last-child{padding-right:0}
+th{color:var(--ink2);font-size:14px;font-weight:600;text-align:left;
+ padding-bottom:10px;border-bottom:1px solid var(--line)}
+td{padding-top:11px;padding-bottom:11px;border-bottom:1px solid var(--hair);vertical-align:top}
+td.n,th.n{text-align:right}
+td.tk,th.tk{white-space:normal;width:100%;min-width:240px}
+.dl{position:fixed;right:28px;bottom:28px;width:58px;height:58px;border-radius:18px;
+ display:flex;align-items:center;justify-content:center;background:var(--s1);
+ color:var(--onS1);text-decoration:none;z-index:8;
+ box-shadow:0 8px 28px rgba(0,0,0,.28);
+ transition:transform .15s ease,filter .15s ease}
+.dl:hover{filter:brightness(1.1);transform:translateY(-2px)}
+.dl:active{transform:translateY(0)}
+.dl svg{width:24px;height:24px}
+footer{color:var(--ink2);font-size:14px;margin-top:36px}
+#tip{position:fixed;pointer-events:none;opacity:0;background:var(--tipbg);
+ border-radius:8px;padding:8px 11px;font-size:14px;color:var(--tipink);
+ transition:opacity .12s;z-index:9;white-space:nowrap}
+@media (prefers-reduced-motion:reduce){*{transition:none!important}}
+"""
+
+    _REPORT_JS = """
+var tip=document.getElementById('tip');
+document.querySelectorAll('[data-tip]').forEach(function(el){
+  el.addEventListener('mouseenter',function(){tip.textContent=el.dataset.tip;tip.style.opacity=1});
+  el.addEventListener('mousemove',function(e){
+    var x=e.clientX+14,y=e.clientY+14;
+    if(x+tip.offsetWidth>innerWidth-8){x=e.clientX-tip.offsetWidth-14}
+    tip.style.left=x+'px';tip.style.top=y+'px'});
+  el.addEventListener('mouseleave',function(){tip.style.opacity=0});
+});
+function paint(){
+  document.querySelectorAll('.tt li').forEach(function(el,i){
+    setTimeout(function(){el.classList.add('in');
+      var b=el.querySelector('.ttb i');if(b)b.style.width=b.dataset.w},90+i*70)});
+  document.querySelectorAll('[data-h]').forEach(function(el,i){
+    setTimeout(function(){el.style.height=el.dataset.h},220+i*16)});
+  var hero=document.getElementById('hero');
+  if(!hero)return;
+  var end=parseFloat(hero.dataset.secs),t0=null,done=false;
+  function pad(n){return String(n).padStart(2,'0')}
+  // Truncate, matching _fmt_time — rounding here would drift the hero a second
+  // away from the legend, the table and the workbook.
+  function f(s){s=Math.floor(s);return pad(Math.floor(s/3600))+':'+pad(Math.floor(s%3600/60))+':'+pad(s%60)}
+  function land(){done=true;hero.textContent=f(end)}
+  function step(ts){if(done)return;if(!t0)t0=ts;var p=Math.min(1,(ts-t0)/800);
+    if(p>=1){land();return}
+    hero.textContent=f(end*(1-Math.pow(1-p,3)));requestAnimationFrame(step)}
+  requestAnimationFrame(step);
+  // The count-up must never own the truth. If rAF timestamps stall (background tab,
+  // throttling) the loop would keep repainting a partial billable total forever, so
+  // this both lands the real value and stops the loop from overwriting it.
+  setTimeout(land,900);
+}
+if(matchMedia('(prefers-reduced-motion:reduce)').matches){
+  document.querySelectorAll('[data-h]').forEach(function(el){el.style.height=el.dataset.h});
+  document.querySelectorAll('.ttb i').forEach(function(el){el.style.width=el.dataset.w});
+  document.querySelectorAll('.tt li').forEach(function(el){el.classList.add('in')});
+}else{addEventListener('load',paint)}
+"""
+
+    def _build_workbook(self, d_from, d_to, tasks, durations, total):
+        """Two sheets: Report (summary + pie + bar) and Detail (one row per task)."""
+        from openpyxl import Workbook
+        from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+        from openpyxl.chart import BarChart, Reference
+
+        header_font = Font(bold=True, color="FFFFFF", size=11)
+        accent_fill = PatternFill(start_color=self._accent_hex,
+                                  end_color=self._accent_hex, fill_type="solid")
+        bold = Font(bold=True, size=11)
+        grey = Font(color="888888", size=10)
+        thin = Border(bottom=Side(style="thin", color="DDDDDD"))
+        centered = Alignment(horizontal="center")
+
+        def _head(ws, row: int, titles: list) -> None:
+            for col, title in enumerate(titles, 1):
+                c = ws.cell(row=row, column=col, value=title)
+                c.font = header_font
+                c.fill = accent_fill
+                c.alignment = centered
+
+        wb = Workbook()
+
+        # ── Report sheet: summary + breakdown + charts ──
+        ws = wb.active
+        ws.title = "Report"
+        ws["A1"] = "⏱ Time Report"
+        ws["A1"].font = Font(bold=True, size=14)
+        ws["A2"] = f"{self._project or 'Timex'} · {self._period_label(self._export_period)}"
+        ws["A2"].font = grey
+
+        by_day: dict[date, float] = {}
+        for t, secs in zip(tasks, durations):
+            d = t.wall_start.date()
+            by_day[d] = by_day.get(d, 0.0) + secs
+        busiest = max(by_day.items(), key=lambda kv: kv[1])
+        avg = total / len(by_day)
+        longest = max(durations)
+
+        ws["A4"] = "Summary"
+        ws["A4"].font = bold
+        summary = [
+            ("Total", self._fmt_time(total), total / 3600),
+            ("Days worked", len(by_day), None),
+            ("Tasks", len(tasks), None),
+            ("Avg / day", self._fmt_time(avg), avg / 3600),
+            ("Longest task", self._fmt_time(longest), longest / 3600),
+            ("Busiest day", busiest[0].strftime("%a, %b ") + str(busiest[0].day),
+             busiest[1] / 3600),
+        ]
+        for i, (label, value, hours) in enumerate(summary, start=5):
+            ws.cell(row=i, column=1, value=label).font = grey
+            ws.cell(row=i, column=2, value=value)
+            if hours is not None:
+                c = ws.cell(row=i, column=3, value=round(hours, 2))
+                c.number_format = "0.00"
+                c.font = grey
+
+        # Biggest tasks, not a breakdown: names are near-unique, so a pie would put
+        # ~80% of a month into one "Other" wedge and say nothing.
+        ranked = self._top_tasks(tasks, durations, total, 10)
+
+        top = 12
+        ws.cell(row=top, column=1, value="Longest tasks").font = bold
+        _head(ws, top + 1, ["Task", "Duration", "Hours", "Share"])
+        for i, (name, secs, share) in enumerate(ranked):
+            r = top + 2 + i
+            ws.cell(row=r, column=1, value=name)
+            ws.cell(row=r, column=2, value=self._fmt_time(secs))
+            c = ws.cell(row=r, column=3, value=round(secs / 3600, 2))
+            c.number_format = "0.00"
+            c = ws.cell(row=r, column=4, value=share)
+            c.number_format = "0.0%"
+            for col in range(1, 5):
+                ws.cell(row=r, column=col).border = thin
+        task_last = top + 1 + len(ranked)
+
+        task_bar = BarChart()
+        task_bar.type = "bar"  # horizontal: long task names need the room
+        task_bar.title = "Longest tasks"
+        task_bar.add_data(Reference(ws, min_col=3, min_row=top + 1, max_row=task_last),
+                          titles_from_data=True)
+        task_bar.set_categories(Reference(ws, min_col=1, min_row=top + 2, max_row=task_last))
+        task_bar.height, task_bar.width = 9.5, 16
+        task_bar.legend = None
+        ws.add_chart(task_bar, "F4")
+
+        day_top = task_last + 2
+        ws.cell(row=day_top, column=1, value="By day").font = bold
+        _head(ws, day_top + 1, ["Date", "Duration", "Hours"])
+        r = day_top + 2
+        d = d_from
+        while d <= d_to:
+            secs = by_day.get(d, 0.0)
+            ws.cell(row=r, column=1, value=d.strftime("%a %d %b"))
+            ws.cell(row=r, column=2, value=self._fmt_time(secs))
+            c = ws.cell(row=r, column=3, value=round(secs / 3600, 2))
+            c.number_format = "0.00"
+            for col in range(1, 4):
+                ws.cell(row=r, column=col).border = thin
+            d += timedelta(days=1)
+            r += 1
+        day_last = r - 1
+
+        if day_last > day_top + 2:  # a bar chart of one day is pointless
+            bar = BarChart()
+            bar.type = "col"
+            bar.title = "Hours per day"
+            bar.add_data(Reference(ws, min_col=3, min_row=day_top + 1, max_row=day_last),
+                         titles_from_data=True)
+            bar.set_categories(Reference(ws, min_col=1, min_row=day_top + 2, max_row=day_last))
+            bar.height, bar.width = 8, 18
+            bar.legend = None
+            ws.add_chart(bar, f"F{day_top}")
+
+        for col, width in {"A": 34, "B": 12, "C": 10, "D": 8}.items():
+            ws.column_dimensions[col].width = width
+
+        # ── Detail sheet: one row per task ──
+        ws2 = wb.create_sheet("Detail")
+        _head(ws2, 1, ["#", "Date", "Start", "End", "Task", "Duration", "Hours"])
+        for i, (t, secs) in enumerate(zip(tasks, durations), 1):
+            r = i + 1
+            end = t.wall_end or self._now()
+            ws2.cell(row=r, column=1, value=i).alignment = centered
+            ws2.cell(row=r, column=2, value=t.wall_start.strftime("%Y-%m-%d"))
+            ws2.cell(row=r, column=3, value=t.wall_start.strftime("%H:%M:%S"))
+            ws2.cell(row=r, column=4, value=end.strftime("%H:%M:%S"))
+            ws2.cell(row=r, column=5, value=t.name)
+            ws2.cell(row=r, column=6, value=self._fmt_time(secs))
+            c = ws2.cell(row=r, column=7, value=round(secs / 3600, 2))
+            c.number_format = "0.00"
+            for col in range(1, 8):
+                ws2.cell(row=r, column=col).border = thin
+        total_row = len(tasks) + 2
+        ws2.cell(row=total_row, column=5, value="TOTAL").font = bold
+        ws2.cell(row=total_row, column=6, value=self._fmt_time(total)).font = bold
+        c = ws2.cell(row=total_row, column=7, value=round(total / 3600, 2))
+        c.font = bold
+        c.number_format = "0.00"
+        ws2.auto_filter.ref = f"A1:G{len(tasks) + 1}"
+        ws2.freeze_panes = "A2"
+        for col, width in {"A": 6, "B": 12, "C": 11, "D": 11,
+                           "E": 46, "F": 12, "G": 9}.items():
+            ws2.column_dimensions[col].width = width
+
+        return wb
+
+    # ── Visual report (.html) ────────────────────────────────────────────
+
+    def _report_html(self, d_from, d_to, tasks, durations, total, xlsx_b64, xlsx_name) -> str:
+        """Self-contained report page: no network, no server, safe to send on."""
+        top = self._top_tasks(tasks, durations, total, 10)
+        days = self._export_by_day(tasks, durations, d_from, d_to)
+        by_day = {d: s for d, s in days if s > 0}
+        busiest = max(by_day.items(), key=lambda kv: kv[1])
+        avg = total / len(by_day)
+        e = _esc
+
+        # A lone day charted by itself is a full-height rectangle that says nothing.
+        # Widen the window to its week so the day reads as one day among seven.
+        chart_days, ctx_note = days, ""
+        if (d_to - d_from).days < 6:
+            c_from = d_from - timedelta(days=d_from.weekday())
+            c_to = c_from + timedelta(days=6)
+            ctx_tasks = self._collect_tasks(c_from, c_to)
+            active = self._active_seconds()
+            chart_days = self._export_by_day(
+                ctx_tasks, [self._task_secs(t, active) for t in ctx_tasks], c_from, c_to)
+            ctx_note = ("Shown inside the week of "
+                        f"{c_from.strftime('%b %-d')} – {c_to.strftime('%b %-d')}. "
+                        "Muted bars fall outside this report.")
+
+        # One measure, one hue: bars scale against the biggest task, so a long tail
+        # of near-unique names stays readable instead of collapsing into "Other".
+        widest = max((s for _, s, _ in top), default=1.0) or 1.0
+        top_html = "".join(
+            f'<li><div class="tth"><span class="ttn">{e(n)}</span>'
+            f'<span class="ttv num">{self._fmt_time(s)}<b>{sh * 100:.1f}%</b></span></div>'
+            f'<div class="ttb"><i data-w="{s / widest * 100:.1f}%"></i></div></li>'
+            for n, s, sh in top
+        )
+
+        hero = f'<span id="hero" data-secs="{int(total)}">{self._fmt_time(total)}</span>'
+        longest = max(durations)
+        first = min(t.wall_start for t in tasks)
+        last = max((t.wall_end or self._now()) for t in tasks)
+        if d_from == d_to:
+            # On a single day "avg/day" and "busiest day" only repeat the total.
+            # A session can also run past midnight, and a bare "03:20" would then
+            # read as a short day, so name the weekday it landed on.
+            over = (last.date() - first.date()).days
+            tiles = [
+                ("Tracked", hero, f"{total / 3600:.2f} h", True),
+                ("First entry", first.strftime("%H:%M"), first.strftime("%A"), False),
+                ("Last entry", last.strftime("%H:%M"),
+                 last.strftime("%A") + (f" (+{over}d)" if over else ""), False),
+                ("Tasks", str(len(tasks)), "logged", False),
+                ("Longest task", self._fmt_time(longest), f"{longest / 3600:.2f} h", False),
+                ("Average task", self._fmt_time(total / len(tasks)),
+                 f"{total / len(tasks) / 3600:.2f} h", False),
+            ]
+        else:
+            tiles = [
+                ("Tracked", hero, f"{total / 3600:.2f} h", True),
+                ("Days worked", str(len(by_day)), f"of {len(days)} in period", False),
+                ("Tasks", str(len(tasks)), "logged", False),
+                ("Avg / day", self._fmt_time(avg), f"{avg / 3600:.2f} h", False),
+                ("Longest task", self._fmt_time(longest), f"{longest / 3600:.2f} h", False),
+                ("Busiest day", busiest[0].strftime("%a %-d %b"), self._fmt_time(busiest[1]), False),
+            ]
+
+        # No day timeline. A task's wall span includes any pause taken inside it, and
+        # state.json keeps only a total of paused seconds, never when they happened.
+        # Drawing blocks from wall_start→wall_end therefore claims continuous work:
+        # on 2 Mar that would assert 26:16 of work against 12:23 actually tracked.
+        # Truthful timelines need per-pause timestamps recorded at pause/resume time.
+        tiles_html = "".join(
+            f'<div class="tile{" hero" if hero else ""}"><div class="k">{e(k)}</div>'
+            f'<div class="v num">{v}</div><div class="n num">{e(n)}</div></div>'
+            for k, v, n, hero in tiles
+        )
+
+        peak = max((s for _, s in chart_days), default=0.0) or 1.0
+        bars = []
+        for d, s in chart_days:
+            inside = d_from <= d <= d_to
+            cls = "bar" + ("" if inside else " ctx") + ("" if s else " zero")
+            bars.append(
+                f'<div class="{cls}" data-tip="{d.strftime("%a %-d %b")} · '
+                f'{self._fmt_time(s)}{"" if inside else " · outside report"}">'
+                f'<i data-h="{max(2.0, s / peak * 100):.1f}%"></i></div>'
+            )
+        bars = "".join(bars)
+
+        wide = len(chart_days) > 10
+        step = max(1, len(chart_days) // 12)
+        axis = "".join(
+            f'<span class="num{"" if not (d_from <= d <= d_to) else " on"}">'
+            f'{(d.strftime("%-d") if i % step == 0 else "") if wide else d.strftime("%a %-d")}'
+            f"</span>"
+            for i, (d, _) in enumerate(chart_days)
+        )
+
+        rows = "".join(
+            f"<tr><td class=\"n num\">{i}</td><td class=\"num\">{t.wall_start.strftime('%Y-%m-%d')}</td>"
+            f"<td class=\"num\">{t.wall_start.strftime('%H:%M')}</td>"
+            f"<td class=\"num\">{(t.wall_end or self._now()).strftime('%H:%M')}</td>"
+            f"<td class=\"tk\">{e(t.name)}</td><td class=\"n num\">{self._fmt_time(s)}</td>"
+            f"<td class=\"n num\">{s / 3600:.2f}</td></tr>"
+            for i, (t, s) in enumerate(zip(tasks, durations), 1)
+        )
+
+        period = self._period_label(self._export_period)
+        title = f"Time Report · {self._project or 'Timex'} · {period}"
+        return (
+            f'<!doctype html><html lang="en"><head><meta charset="utf-8">'
+            f'<meta name="viewport" content="width=device-width,initial-scale=1">'
+            f"<title>{e(title)}</title><style>{self._REPORT_CSS}</style></head>"
+            f'<body><div id="tip"></div><div class="wrap">'
+            f'<div class="brand">⏱ Timex</div><h1>Report on Hours</h1>'
+            f'<div class="sub">Kostiantyn Halynskyi · {e(self._project or "Timex")} · '
+            f"{e(period)}</div>"
+            f'<div class="rule"></div><div class="tiles">{tiles_html}</div>'
+            f'<div class="rule"></div><h2>Longest tasks</h2>'
+            f'<div class="note">The {len(top)} single tasks that took the most time, '
+            f"of {len(tasks)} logged. Percentages are of tracked time.</div>"
+            f'<ul class="tt">{top_html}</ul>'
+            f'<div class="rule"></div><h2>Hours per day</h2>'
+            f'<div class="note">{e(ctx_note) if ctx_note else "One bar per calendar day."}</div>'
+            f'<div class="chart"><div class="peak num">peak {self._fmt_time(peak)}</div>'
+            f'<div class="bars">{bars}</div></div><div class="xaxis">{axis}</div>'
+            f'<div class="rule"></div><h2>Detail</h2>'
+            f'<div class="note">Every tracked task, in order.</div><table><thead><tr>'
+            f'<th class="n">#</th><th>Date</th><th>Start</th><th>End</th>'
+            f'<th class="tk">Task</th><th class="n">Duration</th><th class="n">Hours</th></tr></thead>'
+            f"<tbody>{rows}</tbody></table>"
+            f"<footer>Generated by Timex · {self._now().strftime('%Y-%m-%d %H:%M')}</footer>"
+            f'</div><a class="dl" download="{e(xlsx_name)}" aria-label="Download {e(xlsx_name)}" '
+            f'data-tip="Download {e(xlsx_name)}" href="data:application/vnd.'
+            f'openxmlformats-officedocument.spreadsheetml.sheet;base64,{xlsx_b64}">'
+            f'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" '
+            f'stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">'
+            f'<path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/>'
+            f'<polyline points="7 10 12 15 17 10"/><line x1="12" x2="12" y1="15" y2="3"/>'
+            f"</svg></a>"
+            f"<script>{self._REPORT_JS}</script></body></html>"
+        )
+
+    def _export_report(self) -> None:
+        """Build the visual report, embed the workbook in it, open it in the browser."""
+        got = self._export_gather()
+        if not got:
+            return
+        d_from, d_to = got[0], got[1]
+        try:
+            wb = self._build_workbook(*got)
+        except ImportError:
+            self._toast("openpyxl required — pip install openpyxl", 5)
+            return
+        buf = io.BytesIO()
+        wb.save(buf)
+        xlsx_name = self._export_filename(d_from, d_to, "xlsx")
+        html = self._report_html(*got, base64.b64encode(buf.getvalue()).decode(), xlsx_name)
+
+        path = Path.home() / "Downloads" / self._export_filename(d_from, d_to, "html")
+        path.parent.mkdir(exist_ok=True)
+        path.write_text(html, encoding="utf-8")
+        webbrowser.open(path.as_uri())
+        self._leave_view(f"Report → ~/Downloads/{path.name}")
 
     def _cmd_new(self) -> None:
         """Stop timer, save session to history, start fresh."""
@@ -3935,7 +3249,7 @@ class TimexApp(App):
             ("/edit", "Edit task names in timeline"),
             ("/date", "Browse past sessions by date"),
             ("/stats", "Weekly and monthly statistics"),
-            ("/export", "Export to Google Sheets or Excel"),
+            ("/export", "Export hours to Excel (.xlsx)"),
             ("/clear", "Clear task history"),
             ("/timezone", "Change timezone for tracking"),
             ("/notification", "Set reminder interval"),
@@ -4628,23 +3942,12 @@ class TimexApp(App):
 
     def _render_confirm_delete_project(self) -> None:
         name = self._project_to_delete or "?"
-        # Check if project has a linked spreadsheet
-        has_sheet = False
-        cfg_path = PROJECTS_DIR / name / "sheets_config.json"
-        if cfg_path.exists():
-            try:
-                data = json.loads(cfg_path.read_text())
-                has_sheet = bool(data.get("spreadsheet_id"))
-            except (OSError, json.JSONDecodeError):
-                pass
         rows = [
             Text(""),
             Text.from_markup(f"[bold {self._accent}]Delete project '{name}'?[/]"),
             Text(""),
             Text.from_markup(f"[{DIM}]All data will be lost.[/]"),
         ]
-        if has_sheet:
-            rows.append(Text.from_markup(f"[{DIM}]Linked spreadsheet will also be deleted.[/]"))
         rows += [
             Text.from_markup(f"[{SEPARATOR}]{'─' * 50}[/]"),
             Text.from_markup(f"[bold {self._accent}]y.[/] [{TEXT_COLOR}]Confirm delete[/]"),
@@ -4660,18 +3963,8 @@ class TimexApp(App):
             name = self._project_to_delete
             if name:
                 target = PROJECTS_DIR / name
-                # Delete linked spreadsheet if exists
-                cfg_path = target / "sheets_config.json"
-                if cfg_path.exists():
-                    try:
-                        data = json.loads(cfg_path.read_text())
-                        ssid = data.get("spreadsheet_id")
-                        if ssid:
-                            gc, _ = self._get_gspread_client()
-                            gc.del_spreadsheet(ssid)
-                    except Exception:
-                        pass  # best-effort: delete local data even if sheet deletion fails
                 if target.exists():
+                    self._snapshot("project-delete")
                     shutil.rmtree(target)
                 # If deleted current project, switch to another
                 if self._project == name:
@@ -4731,10 +4024,14 @@ class TimexApp(App):
         # Collect all sessions: history + current
         history = self._load_history()
         if self.state in (RUNNING, PAUSED) and self.tasks:
+            active = self._active_seconds()
+            serialized = [self._serialize_task(t) for t in self.tasks]
+            if serialized and serialized[-1].get("active_end") is None:
+                serialized[-1]["active_end"] = active  # count the task in progress
             current = {
                 "date": self.tasks[0].wall_start.strftime("%Y-%m-%d"),
-                "total_active": self._active_seconds(),
-                "tasks": [self._serialize_task(t) for t in self.tasks],
+                "total_active": active,
+                "tasks": serialized,
             }
             history = history + [current]
 
@@ -4836,14 +4133,23 @@ class TimexApp(App):
 
         if task_times_30:
             rows.append(Text.from_markup(f"[{SEPARATOR}]{'─' * 50}[/]"))
-            rows.append(Text.from_markup(f"[bold {TEXT_COLOR}]Top tasks (30 days)[/]"))
+            rows.append(Text.from_markup(f"[bold {TEXT_COLOR}]Longest tasks (30 days)[/]"))
 
-            top = sorted(task_times_30.items(), key=lambda x: x[1], reverse=True)[:5]
-            for i, (name, secs) in enumerate(top, 1):
-                display_name = name if len(name) <= 30 else name[:27] + "..."
+            # Biggest tasks, not a breakdown — names are near-unique, so folding the
+            # tail into "Other" would just draw one huge meaningless bar.
+            ranked = sorted(task_times_30.items(), key=lambda kv: kv[1], reverse=True)[:5]
+            widest = max((v for _, v in ranked), default=0.0) or 1.0
+            grand = sum(task_times_30.values())
+
+            for name, secs in ranked:
+                rows.append(Text(""))
+                filled = max(1, round(secs / widest * 22))
+                bar = f"[{self._accent}]{'█' * filled}[/][{DIMMER}]{'░' * (22 - filled)}[/]"
+                pct = secs / grand * 100 if grand else 0.0
+                display_name = name if len(name) <= 42 else name[:39] + "..."
+                rows.append(Text.from_markup(f"[{TEXT_COLOR}]{display_name}[/]"))
                 rows.append(self._space_between(
-                    f"[{self._accent}]{i}.[/] [{TEXT_COLOR}]{display_name}[/]",
-                    f"[{DIM}]{self._fmt_time(secs)}[/]",
+                    f"{bar}", f"[{DIM}]{self._fmt_time(secs)}[/]  [{TEXT_COLOR}]{pct:4.1f}%[/]",
                 ))
 
         # ── Activity (30 days) ──
@@ -4960,7 +4266,7 @@ class TimexApp(App):
         elif self._view_mode == "project_edit":
             self._project_editing = None
             self._enter_view("project", "  Enter number or type new project name • /back to return")
-        elif self._view_mode in ("dates", "help", "timezone", "notification", "edit", "color", "stats", "project", "watch", "confirm_reset", "export", "update", "confirm_create_sheets"):
+        elif self._view_mode in ("dates", "help", "timezone", "notification", "edit", "color", "stats", "project", "watch", "confirm_reset", "export", "update"):
             self._editing_task = None
             self._leave_view()
         else:
@@ -5123,6 +4429,32 @@ class TimexApp(App):
         entry = self._build_history_entry()
         if entry:
             self._append_history(entry)
+
+    # ── Backups ──────────────────────────────────────────────────────────
+
+    def _snapshot(self, tag: str, once_per_day: bool = False) -> None:
+        """Copy the projects tree aside before anything can destroy it.
+
+        history.json is the only record a session ever gets, so a delete or a bad
+        write is otherwise final. Restoring is a plain folder copy back.
+        """
+        try:
+            if not PROJECTS_DIR.exists() or not any(PROJECTS_DIR.iterdir()):
+                return
+            BACKUP_DIR.mkdir(parents=True, exist_ok=True)
+            now = self._now()
+            if once_per_day:
+                today = now.strftime("%Y%m%d")
+                for p in BACKUP_DIR.iterdir():
+                    if p.is_dir() and p.name.startswith(today) and p.name.endswith(tag):
+                        return
+            shutil.copytree(PROJECTS_DIR,
+                            BACKUP_DIR / f"{now.strftime('%Y%m%d-%H%M%S')}-{tag}")
+            snaps = sorted(p for p in BACKUP_DIR.iterdir() if p.is_dir())
+            for old in snaps[:-BACKUP_KEEP]:
+                shutil.rmtree(old, ignore_errors=True)
+        except OSError:
+            pass  # a backup must never take the app down with it
 
     _history_cache: list[dict] | None = None
     _history_cache_mtime: float = 0.0
@@ -5359,7 +4691,7 @@ class TimexApp(App):
 
         remote_ver = info.get("version", "?")
         changes = info.get("changes", [])
-        dmg_required = info.get("dmg_required", False)
+        dmg_required = info.get("dmg_required", True)
 
         # Header: version
         rows.append(self._space_between(
@@ -5412,7 +4744,7 @@ class TimexApp(App):
         if raw != "1":
             return
         info = self._update_info
-        if not info or info.get("dmg_required", False):
+        if not info or info.get("dmg_required", True):
             return
         if self._update_progress >= 0:
             return  # already updating

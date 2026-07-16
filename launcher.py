@@ -10,10 +10,12 @@ import sys
 import time
 
 PYTHON = sys.executable
-SYSTEM_PYTHON = "/Library/Frameworks/Python.framework/Versions/3.13/bin/python3"
 RESOURCES = os.path.dirname(os.path.abspath(__file__))
 SERVE_PY = os.path.join(RESOURCES, "serve.py")
-MENUBAR_PY = os.path.join(RESOURCES, "menubar.py")
+# The widget runs from the bundle's own second executable (see SCRIPT_MAP in
+# __boot__.py). It has to be an app-bundled binary: a bare python cannot own a
+# menu bar item. Shelling out to a system python worked only on this Mac.
+MENUBAR_EXE = os.path.join(os.path.dirname(PYTHON), "TimexMenubar")
 
 HOST = "127.0.0.1"
 PORT = 47831
@@ -30,13 +32,18 @@ def _port_open(host: str, port: int) -> bool:
 
 
 def _menubar_running() -> bool:
-    """Check if a menubar process is already running."""
+    """True when the widget is already up.
+
+    Matched on the executable name only: a -f match over the whole command line
+    also hits unrelated processes that merely mention these paths (a shell doing
+    maintenance, an editor), and the widget then silently never starts.
+    """
     try:
         out = subprocess.check_output(
-            ["pgrep", "-f", "timex.*menubar.py"], stderr=subprocess.DEVNULL
+            ["pgrep", "-x", "TimexMenubar"], stderr=subprocess.DEVNULL
         )
         return bool(out.strip())
-    except subprocess.CalledProcessError:
+    except (subprocess.CalledProcessError, OSError):
         return False
 
 
@@ -44,11 +51,14 @@ def main() -> None:
     # Start menu bar widget only if not already running
     menubar_proc = None
     if not _menubar_running():
-        menubar_proc = subprocess.Popen(
-            [SYSTEM_PYTHON, MENUBAR_PY],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-        )
+        try:
+            menubar_proc = subprocess.Popen(
+                [MENUBAR_EXE],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+        except OSError:
+            menubar_proc = None  # no widget is bad; no app at all is worse
 
     server_proc = subprocess.Popen(
         [PYTHON, SERVE_PY, HOST, str(PORT)],
@@ -96,9 +106,9 @@ def main() -> None:
                 menubar_proc.wait(timeout=2)
             except OSError:
                 pass
-        # Fallback: kill any remaining by path
+        # Fallback: kill any widget this launcher lost track of
         subprocess.run(
-            ["pkill", "-9", "-f", "timex.*menubar.py"],
+            ["pkill", "-9", "-x", "TimexMenubar"],
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
         )

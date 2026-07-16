@@ -29,6 +29,7 @@ from zoneinfo import ZoneInfo
 
 import AppKit
 import rumps
+from Foundation import NSAttributedString, NSMutableAttributedString
 
 # ── Constants ────────────────────────────────────────────────────────────────
 
@@ -65,6 +66,49 @@ def _active_project_name() -> str | None:
     return None
 
 ICON_PATH = str(Path(__file__).parent / "AppIcon.icns")
+
+GLYPH_IDLE = "○"
+GLYPH_RUNNING = "●"
+GLYPH_PAUSED = "⏸"
+
+_MONO_ATTRS: dict | None = None
+_GLYPH_KERN: dict[str, float] | None = None
+
+
+def _mono_attrs() -> dict:
+    """Menu bar font with fixed-width digits.
+
+    The system UI font renders "1" narrower than "0", so a ticking timer changes
+    the title width every second and shoves neighbouring menu bar items around.
+    """
+    global _MONO_ATTRS
+    if _MONO_ATTRS is None:
+        size = AppKit.NSFont.menuBarFontOfSize_(0).pointSize()
+        font = AppKit.NSFont.monospacedDigitSystemFontOfSize_weight_(
+            size, AppKit.NSFontWeightRegular
+        )
+        _MONO_ATTRS = {AppKit.NSFontAttributeName: font}
+    return _MONO_ATTRS
+
+
+def _glyph_kern(glyph: str) -> float:
+    """Trailing padding that makes every state glyph occupy the same width.
+
+    ⏸ is ~4pt narrower than ○/●, which would shift the title on pause/resume.
+    """
+    global _GLYPH_KERN
+    if _GLYPH_KERN is None:
+        attrs = _mono_attrs()
+        widths = {
+            g: NSAttributedString.alloc()
+            .initWithString_attributes_(g, attrs)
+            .size()
+            .width
+            for g in (GLYPH_IDLE, GLYPH_RUNNING, GLYPH_PAUSED)
+        }
+        box = max(widths.values())
+        _GLYPH_KERN = {g: box - w for g, w in widths.items()}
+    return _GLYPH_KERN.get(glyph, 0.0)
 
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
@@ -194,31 +238,44 @@ class TimexMenuBar(rumps.App):
 
     # ── Tick ──────────────────────────────────────────────────────────────
 
-    # Fixed-width title so other menu bar icons don't shift
-    _FMT_IDLE    = "○  00:00:00"
-    _FMT_RUNNING = "●  {}"
-    _FMT_PAUSED  = "⏸  {}"
+    def _set_title(self, glyph: str, time_str: str) -> None:
+        """Draw the title so its width never changes and never shifts neighbours."""
+        text = f"{glyph}  {time_str}"
+        self._title = text
+        try:
+            button = self._nsapp.nsstatusitem.button()
+        except AttributeError:
+            button = None
+        if button is None:
+            self.title = text
+            return
+        attributed = NSMutableAttributedString.alloc().initWithString_attributes_(
+            text, _mono_attrs()
+        )
+        attributed.addAttribute_value_range_(
+            AppKit.NSKernAttributeName, _glyph_kern(glyph), (0, len(glyph))
+        )
+        button.setAttributedTitle_(attributed)
 
     def _tick(self, _sender=None) -> None:
         data = _read_state()
 
         if data is None:
-            self.title = self._FMT_IDLE
+            self._set_title(GLYPH_IDLE, _fmt_time(0))
             self._set_idle_menu()
             return
 
         state = data.get("state", IDLE)
-        active = _all_sessions_active()
-        time_str = _fmt_time(active)
+        time_str = _fmt_time(_active_seconds(data))
 
         if state == RUNNING:
-            self.title = self._FMT_RUNNING.format(time_str)
+            self._set_title(GLYPH_RUNNING, time_str)
             self._set_running_menu()
         elif state == PAUSED:
-            self.title = self._FMT_PAUSED.format(time_str)
+            self._set_title(GLYPH_PAUSED, time_str)
             self._set_paused_menu()
         else:
-            self.title = self._FMT_IDLE
+            self._set_title(GLYPH_IDLE, _fmt_time(0))
             self._set_idle_menu()
 
     # ── Menu state ────────────────────────────────────────────────────────

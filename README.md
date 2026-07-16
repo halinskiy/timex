@@ -12,10 +12,28 @@ Minimal time tracker for macOS. Dark TUI in a native window, keyboard-driven, no
 - Multi-project support with independent histories
 - Watch mode — automatic activity tracking via screenshots or window focus detection
 - AI task labeling (analyzes screenshots to name tasks automatically)
-- Export to Google Sheets (OAuth2) and Excel (.xlsx)
+- Reports for a day, a week, a month or a custom range:
+  - a self-contained HTML page that opens in a browser and can be sent to a client
+  - an Excel workbook (.xlsx), also embedded in the page as a download
 - Session history by date, statistics
+- Automatic backups of every project's history
 - Customization: accent color (10 presets + custom HEX), timezone, reminder intervals
 - Menu bar widget showing timer status
+
+## Reports
+
+`/export` picks a period, then writes to `~/Downloads`:
+
+- **Visual report (.html)** — one file with everything inlined: no network requests, no
+  server, works offline forever. Summary tiles, the longest tasks, hours per day, and the
+  full task table. The workbook is embedded as a data URI, so the page carries its own
+  download. Follows the reader's light/dark setting.
+- **Excel (.xlsx)** — `Report` sheet (summary + charts) and `Detail` sheet (one row per
+  task, autofiltered). Durations appear both as `HH:MM:SS` and as decimal hours, because
+  invoicing multiplies the decimal ones.
+
+A single-day report charts the whole week around that day, so one day reads as one day
+among seven rather than a full-width block.
 
 ## Architecture
 
@@ -27,9 +45,13 @@ Minimal time tracker for macOS. Dark TUI in a native window, keyboard-driven, no
 
 Separately: **menubar.py** — menu bar widget (rumps), reads `~/.timex/state.json`.
 
+The widget runs from the bundle's own second executable (`MacOS/TimexMenubar`, wired up
+through `SCRIPT_MAP` in `__boot__.py`). A menu bar item needs an app-bundled binary — a
+bare `python` cannot own one.
+
 ## Tech Stack
 
-Python 3.13, Textual, Rich, textual-serve, pywebview, rumps, openpyxl, gspread, PyObjC
+Python 3.13, Textual, Rich, textual-serve, pywebview, rumps, openpyxl, PyObjC
 
 ## Data
 
@@ -45,8 +67,13 @@ All data stored in `~/.timex/`:
     ProjectName/
       state.json
       history.json
-      sheets_config.json
+  backups/            # automatic snapshots of projects/
+    20260716-152459-daily/
 ```
+
+`history.json` is the only record a session ever gets, so the whole `projects/` tree is
+snapshotted on first launch each day and before anything destructive (deleting a session
+or a project). The last 30 snapshots are kept; restoring is a plain folder copy back.
 
 ## Commands
 
@@ -59,14 +86,15 @@ All data stored in `~/.timex/`:
 | `/edit` | Rename or delete tasks |
 | `/add 30m` | Add time to session |
 | `/remove 10m` | Remove time from session |
-| `/watch` | Auto-track activity |
-| `/export` | Export to Sheets or Excel |
+| `/track` | Auto-track activity |
+| `/export` | Report for a period: .html page or .xlsx |
 | `/project` | Switch projects |
 | `/date` | Browse history |
 | `/stats` | View statistics |
 | `/color` | Change accent color |
 | `/timezone` | Set timezone |
 | `/notification` | Configure reminders |
+| `/update` | Check for a new version |
 | `/help` | Show help |
 
 ## Setup
@@ -75,11 +103,6 @@ All data stored in `~/.timex/`:
 
 ```
 pip install textual rich textual-serve pywebview rumps openpyxl
-```
-
-Optional (for Google Sheets export):
-```
-pip install gspread google-auth google-auth-oauthlib
 ```
 
 Optional (for AI task labeling):
@@ -99,6 +122,11 @@ Requires py2app:
 pip install py2app
 python setup.py py2app
 ```
+
+The built app is signed and notarized with `notarize.sh`. Editing anything inside the
+bundle invalidates the signature, so the script has to be re-run for any build meant to
+ship — and updates are delivered as a fresh signed app rather than by patching files in
+place.
 
 ## License
 
