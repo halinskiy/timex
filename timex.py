@@ -76,7 +76,7 @@ AUTOSAVE_INTERVAL = 30  # seconds between autosaves during tick
 CONFIG_FILE = STATE_DIR / "config.json"
 CRASH_LOG = STATE_DIR / "crash.log"
 
-VERSION = "1.2.1"
+VERSION = "1.2.2"
 # Patching these in place rewrites files inside the bundle, which breaks the
 # notarised signature. Updates therefore ship as a fresh signed app: changelog
 # entries default to dmg_required, and self-patching is opt-in per release.
@@ -1073,6 +1073,11 @@ class TimexApp(App):
         raw = event.value.strip()
         inp = self.query_one("#task-input", HistoryInput)
         inp.value = ""
+
+        # The widget writes state.json too, and the tick only notices up to half a
+        # second later. Acting on stale memory and saving it would silently undo
+        # whatever was just clicked in the menu bar, so pull its changes in first.
+        self._check_external_changes()
 
         if not raw:
             if self._view_mode == "edit" and self._editing_task is not None:
@@ -3029,6 +3034,12 @@ if(matchMedia('(prefers-reduced-motion:reduce)').matches){
         )
 
     def _save_state(self) -> None:
+        """Persist the session — a blind overwrite of whatever is on disk.
+
+        Callers must absorb external writes BEFORE mutating state (see
+        _on_submit), never here: by this point the user's change is already in
+        memory, and reloading would throw it away.
+        """
         try:
             STATE_DIR.mkdir(parents=True, exist_ok=True)
             saved_at = self._now().isoformat()
