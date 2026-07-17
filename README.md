@@ -22,10 +22,6 @@ Minimal time tracker for macOS. Dark TUI in a native window, keyboard-driven, no
 
 `/export` picks a period, then writes to `~/Downloads`:
 
-- **Visual report (.html)** — one file with everything inlined: no network requests, no
-  server, works offline forever. Summary tiles, the longest tasks, hours per day, and the
-  full task table. The workbook is embedded as a data URI, so the page carries its own
-  download. Follows the reader's light/dark setting.
 - **Share a link** — publishes the same page to an unlisted address and copies the
   link. The slug is random and the page asks not to be indexed, but the host is
   public: anyone with the link can read it. Needs the `gh` CLI.

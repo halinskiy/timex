@@ -77,7 +77,7 @@ AUTOSAVE_INTERVAL = 30  # seconds between autosaves during tick
 CONFIG_FILE = STATE_DIR / "config.json"
 CRASH_LOG = STATE_DIR / "crash.log"
 
-VERSION = "1.3.1"
+VERSION = "1.3.2"
 # Patching these in place rewrites files inside the bundle, which breaks the
 # notarised signature. Updates therefore ship as a fresh signed app: changelog
 # entries default to dmg_required, and self-patching is opt-in per release.
@@ -1436,15 +1436,11 @@ class TimexApp(App):
 
         rows.append(Text.from_markup(f"[{SEPARATOR}]{'─' * 50}[/]"))
         rows.append(Text.from_markup(
-            f"[bold {self._accent}]5.[/] [{TEXT_COLOR}]Visual report (.html)[/]"
+            f"[bold {self._accent}]5.[/] [{TEXT_COLOR}]Share a link[/]"
         ))
         rows.append(Text.from_markup(f"[{SEPARATOR}]{'─' * 50}[/]"))
         rows.append(Text.from_markup(
-            f"[bold {self._accent}]6.[/] [{TEXT_COLOR}]Share a link[/]"
-        ))
-        rows.append(Text.from_markup(f"[{SEPARATOR}]{'─' * 50}[/]"))
-        rows.append(Text.from_markup(
-            f"[bold {self._accent}]7.[/] [{TEXT_COLOR}]Export to Excel (.xlsx)[/]"
+            f"[bold {self._accent}]6.[/] [{TEXT_COLOR}]Export to Excel (.xlsx)[/]"
         ))
         self.query_one("#history", Static).update(Group(*rows))
 
@@ -1475,10 +1471,8 @@ class TimexApp(App):
             self._export_period = key
             self._render_export()
         elif raw == "5":
-            self._export_report()
-        elif raw == "6":
             self._publish_report()
-        elif raw == "7":
+        elif raw == "6":
             self._export_xlsx()
 
     def _apply_export_range(self, raw: str) -> None:
@@ -1857,7 +1851,7 @@ if(matchMedia('(prefers-reduced-motion:reduce)').matches){
 
         return wb
 
-    # ── Visual report (.html) ────────────────────────────────────────────
+    # ── Report page (for Share a link) ───────────────────────────────────
 
     def _report_html(self, d_from, d_to, tasks, durations, total, xlsx_b64, xlsx_name) -> str:
         """Self-contained report page: no network, no server, safe to send on."""
@@ -2064,27 +2058,6 @@ if(matchMedia('(prefers-reduced-motion:reduce)').matches){
 
         threading.Thread(target=_push, daemon=True).start()
 
-    def _export_report(self) -> None:
-        """Build the visual report, embed the workbook in it, open it in the browser."""
-        got = self._export_gather()
-        if not got:
-            return
-        d_from, d_to = got[0], got[1]
-        try:
-            wb = self._build_workbook(*got)
-        except ImportError:
-            self._toast("Export unavailable: openpyxl is missing", 5)
-            return
-        buf = io.BytesIO()
-        wb.save(buf)
-        xlsx_name = self._export_filename(d_from, d_to, "xlsx")
-        html = self._report_html(*got, base64.b64encode(buf.getvalue()).decode(), xlsx_name)
-
-        path = Path.home() / "Downloads" / self._export_filename(d_from, d_to, "html")
-        path.parent.mkdir(exist_ok=True)
-        path.write_text(html, encoding="utf-8")
-        webbrowser.open(path.as_uri())
-        self._leave_view(f"Report → ~/Downloads/{path.name}")
 
     def _cmd_new(self) -> None:
         """Stop timer, save session to history, start fresh."""
