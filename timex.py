@@ -31,6 +31,7 @@ from datetime import date, datetime, timedelta
 from html import escape as _esc
 from pathlib import Path
 import re
+import secrets
 import shutil
 import tempfile
 from dataclasses import dataclass
@@ -76,7 +77,7 @@ AUTOSAVE_INTERVAL = 30  # seconds between autosaves during tick
 CONFIG_FILE = STATE_DIR / "config.json"
 CRASH_LOG = STATE_DIR / "crash.log"
 
-VERSION = "1.2.2"
+VERSION = "1.3.0"
 # Patching these in place rewrites files inside the bundle, which breaks the
 # notarised signature. Updates therefore ship as a fresh signed app: changelog
 # entries default to dmg_required, and self-patching is opt-in per release.
@@ -1439,7 +1440,11 @@ class TimexApp(App):
         ))
         rows.append(Text.from_markup(f"[{SEPARATOR}]{'─' * 50}[/]"))
         rows.append(Text.from_markup(
-            f"[bold {self._accent}]6.[/] [{TEXT_COLOR}]Export to Excel (.xlsx)[/]"
+            f"[bold {self._accent}]6.[/] [{TEXT_COLOR}]Share a link[/]"
+        ))
+        rows.append(Text.from_markup(f"[{SEPARATOR}]{'─' * 50}[/]"))
+        rows.append(Text.from_markup(
+            f"[bold {self._accent}]7.[/] [{TEXT_COLOR}]Export to Excel (.xlsx)[/]"
         ))
         self.query_one("#history", Static).update(Group(*rows))
 
@@ -1472,6 +1477,8 @@ class TimexApp(App):
         elif raw == "5":
             self._export_report()
         elif raw == "6":
+            self._publish_report()
+        elif raw == "7":
             self._export_xlsx()
 
     def _apply_export_range(self, raw: str) -> None:
@@ -1999,6 +2006,75 @@ if(matchMedia('(prefers-reduced-motion:reduce)').matches){
             f"</svg></a>"
             f"<script>{self._REPORT_JS}</script></body></html>"
         )
+
+    # gh is how we push, and a Finder-launched app gets a bare PATH, so look in
+    # the places Homebrew and the installer actually put it.
+    _GH_CANDIDATES = ("/opt/homebrew/bin/gh", "/usr/local/bin/gh", "/usr/bin/gh")
+    REPORTS_REPO = "halinskiy/timex-reports"
+    REPORTS_URL = "https://halinskiy.github.io/timex-reports"
+
+    @classmethod
+    def _gh_path(cls) -> str | None:
+        for p in cls._GH_CANDIDATES:
+            if os.path.isfile(p) and os.access(p, os.X_OK):
+                return p
+        return None
+
+    def _publish_report(self) -> None:
+        """Put the report on the web and hand back a link to send a client.
+
+        The address carries a random slug and the page asks not to be indexed,
+        but the host is public: anyone holding the link can read it.
+        """
+        gh = self._gh_path()
+        if not gh:
+            self._toast("Publishing needs the gh CLI — brew install gh", 5)
+            return
+        got = self._export_gather()
+        if not got:
+            return
+        d_from, d_to = got[0], got[1]
+        try:
+            wb = self._build_workbook(*got)
+        except ImportError:
+            self._toast("Export unavailable: openpyxl is missing", 5)
+            return
+        buf = io.BytesIO()
+        wb.save(buf)
+        xlsx_name = self._export_filename(d_from, d_to, "xlsx")
+        html = self._report_html(*got, base64.b64encode(buf.getvalue()).decode(), xlsx_name)
+        html = html.replace(
+            '<meta name="viewport"',
+            '<meta name="robots" content="noindex,nofollow"><meta name="viewport"', 1)
+
+        slug = secrets.token_hex(6)
+        payload = base64.b64encode(html.encode()).decode()
+        self._toast("Publishing…", 30)
+
+        def _push() -> None:
+            try:
+                proc = subprocess.run(
+                    [gh, "api", "-X", "PUT",
+                     f"repos/{self.REPORTS_REPO}/contents/r/{slug}/index.html",
+                     "-f", f"message=Report {d_from} — {d_to}",
+                     "-f", f"content={payload}"],
+                    capture_output=True, text=True, timeout=60,
+                )
+            except (OSError, subprocess.TimeoutExpired) as exc:
+                self.call_from_thread(self._toast, f"Publish failed: {exc}", 6)
+                return
+            if proc.returncode != 0:
+                err = (proc.stderr or "").strip().splitlines()
+                self.call_from_thread(self._toast, f"Publish failed: {err[-1] if err else '?'}", 6)
+                return
+            url = f"{self.REPORTS_URL}/r/{slug}/"
+            try:
+                subprocess.run(["pbcopy"], input=url, text=True, timeout=5)
+            except (OSError, subprocess.TimeoutExpired):
+                pass
+            self.call_from_thread(self._toast, f"Link copied — {url}", 12)
+
+        threading.Thread(target=_push, daemon=True).start()
 
     def _export_report(self) -> None:
         """Build the visual report, embed the workbook in it, open it in the browser."""
