@@ -1,8 +1,0 @@
-{
-  "version": "1.1.2",
-  "dmg_required": true,
-  "changes": [
-    "/timezone removed — timestamps are naive, so changing zone mid-session shifted the clock. Both the app and the widget now use the local wall clock.",
-    "The widget no longer re-reads config.json every second"
-  ]
-}

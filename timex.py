@@ -32,9 +32,7 @@ from html import escape as _esc
 from pathlib import Path
 import re
 import shutil
-import ssl
 import tempfile
-import urllib.request
 from dataclasses import dataclass
 
 from textual.app import App, ComposeResult
@@ -61,18 +59,6 @@ PAUSED = "paused"
 DEFAULT_ACCENT = "#e8a55d"
 DEFAULT_ACCENT_HEX = "E8A55D"
 
-COLOR_PRESETS = [
-    ("#e8a55d", "Amber"),
-    ("#f5a623", "Orange"),
-    ("#e06c75", "Rose"),
-    ("#e55561", "Red"),
-    ("#c678dd", "Purple"),
-    ("#61afef", "Blue"),
-    ("#56b6c2", "Cyan"),
-    ("#98c379", "Green"),
-    ("#d4d4d4", "Silver"),
-    ("#e5c07b", "Gold"),
-]
 DIM = "#555555"
 DIMMER = "#333333"
 SEPARATOR = "#222222"
@@ -90,20 +76,10 @@ AUTOSAVE_INTERVAL = 30  # seconds between autosaves during tick
 CONFIG_FILE = STATE_DIR / "config.json"
 CRASH_LOG = STATE_DIR / "crash.log"
 
-VERSION = "1.1.2"
+VERSION = "1.2.0"
 # Patching these in place rewrites files inside the bundle, which breaks the
 # notarised signature. Updates therefore ship as a fresh signed app: changelog
 # entries default to dmg_required, and self-patching is opt-in per release.
-UPDATE_FILES = ["timex.py", "menubar.py", "launcher.py", "serve.py"]
-UPDATE_BASE_URL = "https://raw.githubusercontent.com/halinskiy/timex/main"
-CHANGELOG_URL = f"{UPDATE_BASE_URL}/changelog.json"
-_SSL_CTX = ssl.create_default_context()
-try:
-    import certifi
-    _SSL_CTX.load_verify_locations(certifi.where())
-except Exception:
-    _SSL_CTX.check_hostname = False
-    _SSL_CTX.verify_mode = ssl.CERT_NONE
 
 
 # ── Cyrillic → Latin map (ЙЦУКЕН → QWERTY keyboard layout) ──────────────────
@@ -155,9 +131,9 @@ class TaskEntry:
 # ── Command suggestions ──────────────────────────────────────────────────────
 
 STATE_COMMANDS: dict[str, list[str]] = {
-    IDLE:    ["/start", "/new", "/date", "/stats", "/export", "/edit", "/clear", "/help", "/notification", "/color", "/project", "/update", "/reload"],
-    RUNNING: ["/pause", "/add", "/remove", "/sleep", "/reset", "/new", "/clear", "/date", "/stats", "/export", "/edit", "/help", "/notification", "/color", "/project", "/update", "/reload"],
-    PAUSED:  ["/resume", "/add", "/remove", "/reset", "/new", "/clear", "/date", "/stats", "/export", "/edit", "/help", "/notification", "/color", "/project", "/update", "/reload"],
+    IDLE:    ["/start", "/new", "/date", "/stats", "/export", "/edit", "/clear", "/help", "/notification", "/project"],
+    RUNNING: ["/pause", "/add", "/remove", "/reset", "/new", "/clear", "/date", "/stats", "/export", "/edit", "/help", "/notification", "/project"],
+    PAUSED:  ["/resume", "/add", "/remove", "/reset", "/new", "/clear", "/date", "/stats", "/export", "/edit", "/help", "/notification", "/project"],
 }
 
 
@@ -311,10 +287,6 @@ class HistoryInput(Input):
         if event.key == "up":
             event.prevent_default()
             event.stop()
-            if not self.value and app and getattr(app, "_update_notified", False) and getattr(app, "_view_mode", "") == "timeline":
-                self.value = "/update"
-                self.cursor_position = len(self.value)
-                return True
             if self._history:
                 if self._history_index == -1:
                     self._draft = self.value
@@ -489,11 +461,7 @@ class TimexApp(App):
         self._project_editing: int | None = None  # index of project being renamed
         self._project_to_delete: str | None = None  # project name pending deletion
         self._project: str | None = None  # active project name
-        self._update_info: dict | None = None  # cached changelog from GitHub
-        self._update_progress: float = -1  # -1=idle, 0..1=downloading, 2=done
-        self._update_notified: bool = False  # enables gradient border + placeholder
         self._input_wait_t: float = 0.0  # 0.0=accent, 1.0=blue (smooth transition)
-        self._sleep_at: float = 0.0  # monotonic time when /sleep should fire
 
         
 
@@ -544,7 +512,6 @@ class TimexApp(App):
         self._update_placeholder()
         self.call_after_refresh(lambda: self.query_one("#task-input", HistoryInput).focus())
         self._snapshot("daily", once_per_day=True)
-        threading.Thread(target=self._check_update_bg, daemon=True).start()
 
     def on_click(self) -> None:
         self.query_one("#task-input", HistoryInput).focus()
@@ -673,12 +640,11 @@ class TimexApp(App):
             if self.state != IDLE:
                 self._render_all()
                 self._check_reminder()
-                self._check_sleep()
                 now = _time.monotonic()
                 if now - self._last_autosave >= AUTOSAVE_INTERVAL:
                     self._last_autosave = now
                     self._save_state()
-            elif self._update_notified or self._is_input_waiting() or self._input_wait_t > 0.0:
+            elif self._is_input_waiting() or self._input_wait_t > 0.0:
                 self._render_footer()
         except Exception:
             CRASH_LOG.parent.mkdir(parents=True, exist_ok=True)
@@ -768,10 +734,6 @@ class TimexApp(App):
             scroll.border_title = "Notifications"
             self._render_notification()
             return
-        if self._view_mode == "color":
-            scroll.border_title = "Accent Color"
-            self._render_color()
-            return
         if self._view_mode == "edit":
             scroll.border_title = "Edit Tasks"
             self._render_edit()
@@ -800,10 +762,6 @@ class TimexApp(App):
             scroll.border_title = "Reset"
             self._render_confirm_reset()
             return
-        if self._view_mode == "update":
-            scroll.border_title = "Update"
-            self._render_update()
-            return
         if self._view_mode == "dates":
             scroll.border_title = "History"
             self._render_dates_list()
@@ -824,16 +782,7 @@ class TimexApp(App):
         scroll.border_title = "Timeline"
         display_tasks = self.tasks if self.tasks else self._last_session_tasks
         if not display_tasks:
-            if self._update_notified and self.state == IDLE:
-                ver = self._update_info.get("version", "?") if self._update_info else "?"
-                rows = [
-                    Text(""),
-                    Text.from_markup(f"  [bold {self._accent}]v{ver} available[/]"),
-                    Text(""),
-                    Text.from_markup(f"  [{DIM}]Press[/] [bold {TEXT_COLOR}]\u2191[/] [{DIM}]and[/] [bold {TEXT_COLOR}]Enter[/] [{DIM}]to update[/]"),
-                ]
-                self.query_one("#history", Static).update(Group(*rows))
-            elif self.state == RUNNING:
+            if self.state == RUNNING:
                 self.query_one("#history", Static).update(
                     Text.from_markup(f"\n  [white]Type what you\u2019re working on[/]\n"))
             elif self.state == PAUSED:
@@ -1068,31 +1017,6 @@ class TimexApp(App):
         self._invalidate_history_cache()
 
     # Smooth gradient keyframes for update border
-    _GRADIENT_KEYS = [
-        (0xe8, 0xa5, 0x5d),  # Amber
-        (0xf5, 0xa6, 0x23),  # Orange
-        (0xe5, 0xc0, 0x7b),  # Gold
-        (0xe0, 0x6c, 0x75),  # Rose
-        (0xc6, 0x78, 0xdd),  # Purple
-        (0x61, 0xaf, 0xef),  # Blue
-        (0x56, 0xb6, 0xc2),  # Cyan
-        (0x98, 0xc3, 0x79),  # Green
-        (0xe8, 0xa5, 0x5d),  # back to Amber
-    ]
-    _GRADIENT_PERIOD = 24.0
-
-    def _update_gradient_color(self) -> str:
-        t = (_time.monotonic() % self._GRADIENT_PERIOD) / self._GRADIENT_PERIOD
-        n = len(self._GRADIENT_KEYS) - 1
-        pos = t * n
-        i = min(int(pos), n - 1)
-        frac = pos - i
-        r1, g1, b1 = self._GRADIENT_KEYS[i]
-        r2, g2, b2 = self._GRADIENT_KEYS[i + 1]
-        r = int(r1 + (r2 - r1) * frac)
-        g = int(g1 + (g2 - g1) * frac)
-        b = int(b1 + (b2 - b1) * frac)
-        return f"#{r:02x}{g:02x}{b:02x}"
 
     def _is_input_waiting(self) -> bool:
         """True when app is waiting for freeform text from user."""
@@ -1128,9 +1052,7 @@ class TimexApp(App):
             self._input_wait_t = max(0.0, self._input_wait_t - step)
 
         inp = self.query_one("#task-input", HistoryInput)
-        if self._update_notified and self._view_mode == "timeline":
-            inp.styles.border = ("tall", self._update_gradient_color())
-        elif self._input_wait_t > 0.0:
+        if self._input_wait_t > 0.0:
             inp.styles.border = ("tall", self._waiting_border_color())
         else:
             inp.styles.border = ("tall", self._accent)
@@ -1195,16 +1117,12 @@ class TimexApp(App):
             self._cmd_add_time(raw)
         elif cmd.startswith("/remove"):
             self._cmd_remove_time(raw)
-        elif cmd.startswith("/sleep"):
-            self._cmd_sleep(raw)
         elif cmd == "/date":
             self._cmd_date()
         elif cmd == "/help":
             self._cmd_help()
         elif cmd == "/notification":
             self._cmd_notification()
-        elif cmd == "/color":
-            self._cmd_color()
         elif cmd == "/edit":
             self._cmd_edit()
         elif cmd == "/stats":
@@ -1213,10 +1131,6 @@ class TimexApp(App):
             self._cmd_back()
         elif cmd == "/reset":
             self._cmd_reset()
-        elif cmd == "/reload":
-            self._cmd_reload()
-        elif cmd == "/update":
-            self._cmd_update()
         elif cmd == "/project":
             self._cmd_project()
         elif self._view_mode == "edit":
@@ -1229,8 +1143,6 @@ class TimexApp(App):
             self._select_edit_sessions(raw)
         elif self._view_mode == "notification":
             self._select_notification(raw)
-        elif self._view_mode == "color":
-            self._select_color(raw)
         elif self._view_mode == "project":
             self._select_project(raw)
         elif self._view_mode == "project_edit":
@@ -1239,8 +1151,6 @@ class TimexApp(App):
             self._select_confirm_delete_project(raw)
         elif self._view_mode == "confirm_reset":
             self._select_confirm_reset(raw)
-        elif self._view_mode == "update":
-            self._select_update(raw)
         elif self._view_mode == "export":
             self._select_export(raw)
         elif raw.startswith("/"):
@@ -1268,7 +1178,6 @@ class TimexApp(App):
             self.paused_at = None
             self.total_paused = timedelta()
             self._final_active = 0.0
-            self._sleep_at = 0.0  # ditto: the old deadline dies with the old session
             self._view_mode = "timeline"
             self._save_state()  # persist clean state first
             if entry:
@@ -1305,45 +1214,6 @@ class TimexApp(App):
         self._mark_dirty()
         self._save_state()
 
-    def _cmd_sleep(self, raw: str) -> None:
-        """Schedule auto-pause after a duration. Usage: /sleep 30m, /sleep 1h"""
-        if self.state != RUNNING:
-            self._toast("Timer is not running")
-            return
-        arg = raw[len("/sleep"):].strip()
-        if not arg:
-            if self._sleep_at:
-                remaining = self._sleep_at - _time.monotonic()
-                if remaining > 0:
-                    self._toast(f"Sleep in {self._fmt_time(remaining)}")
-                else:
-                    self._toast("No sleep timer set")
-            else:
-                self._toast("Usage: /sleep 30m, /sleep 1h")
-            return
-        if arg.lower() == "off":
-            self._sleep_at = 0.0
-            self._toast("Sleep timer cancelled")
-            return
-        secs = self._parse_duration(arg)
-        if not secs:
-            self._toast("Usage: /sleep 30m, /sleep 1h")
-            return
-        self._sleep_at = _time.monotonic() + secs
-        h, rem = divmod(int(secs), 3600)
-        m = rem // 60
-        label = ""
-        if h: label += f"{h}h"
-        if m: label += f"{m}m"
-        if not label: label = f"{int(secs)}s"
-        self._toast(f"Timer will pause in {label}")
-
-    def _check_sleep(self) -> None:
-        """Auto-pause when sleep timer fires."""
-        if self._sleep_at and self.state == RUNNING and _time.monotonic() >= self._sleep_at:
-            self._sleep_at = 0.0
-            self._cmd_pause()
-            self._system_notify("Timer auto-paused (sleep)")
 
     def _cmd_resume(self) -> None:
         # Can't resume from history view — use /start instead
@@ -1399,7 +1269,6 @@ class TimexApp(App):
             self.paused_at = None
             self.total_paused = timedelta()
             self._final_active = 0.0
-            self._sleep_at = 0.0
             self._leave_view("Session reset")
             self._save_state()
         else:
@@ -2137,7 +2006,6 @@ if(matchMedia('(prefers-reduced-motion:reduce)').matches){
         self.paused_at = None
         self.total_paused = timedelta()
         self._final_active = 0.0
-        self._sleep_at = 0.0
         self._view_mode = "timeline"
         self._update_placeholder()
         self._mark_dirty()
@@ -2152,7 +2020,6 @@ if(matchMedia('(prefers-reduced-motion:reduce)').matches){
         self.paused_at = None
         self.total_paused = timedelta()
         self._final_active = 0.0
-        self._sleep_at = 0.0  # a deadline from the old session must not pause the next one
         self._update_placeholder()
         self._mark_dirty()
         self._save_state()
@@ -2233,12 +2100,8 @@ if(matchMedia('(prefers-reduced-motion:reduce)').matches){
             ("/export", "Report a period: visual .html page or .xlsx"),
             ("/clear", "Discard current session without saving"),
             ("/notification", "Set reminder interval"),
-            ("/sleep", "Auto-pause after duration (e.g. 30m, 1h)"),
             ("/reset", "Reset session (discard without saving)"),
             ("/project", "Switch project"),
-            ("/update", "Check for a new version"),
-            ("/reload", "Reload app (apply code changes)"),
-            ("/color", "Change accent color"),
             ("/help", "Show this help"),
             ("/back", "Return to previous view"),
         ]
@@ -2344,53 +2207,6 @@ if(matchMedia('(prefers-reduced-motion:reduce)').matches){
 
     # ── Color ─────────────────────────────────────────────────────────
 
-    def _cmd_color(self) -> None:
-        self._enter_view("color", "  Enter number or HEX code (e.g. FF6B35) \u2022 /back to return")
-
-    def _render_color(self) -> None:
-        rows = []
-
-        # Current
-        rows.append(Text.from_markup(
-            f"[bold {TEXT_COLOR}]Current:[/]  [{self._accent}]\u2588\u2588\u2588[/]  [{DIM}]{self._accent}[/]"
-        ))
-        rows.append(Text.from_markup(f"[{SEPARATOR}]{'─' * 50}[/]"))
-
-        # Presets
-        for i, (hex_val, name) in enumerate(COLOR_PRESETS, start=1):
-            marker = f" [{self._accent}]\u2022[/]" if hex_val == self._accent else ""
-            if i > 1:
-                rows.append(Text.from_markup(f"[{SEPARATOR}]{'─' * 50}[/]"))
-            rows.append(Text.from_markup(
-                f"[bold {self._accent}]{i}.[/] [{hex_val}]\u2588\u2588[/]  [{TEXT_COLOR}]{name}[/]  [{DIM}]{hex_val}[/]{marker}"
-            ))
-
-        rows.append(Text(""))
-        rows.append(Text.from_markup(
-            f"  [{DIM}]Or type a HEX color (e.g. FF6B35, #A1B2C3)[/]"
-        ))
-
-        self.query_one("#history", Static).update(Group(*rows))
-
-    def _select_color(self, raw: str) -> None:
-        if raw.isdigit():
-            num = int(raw)
-            if 1 <= num <= len(COLOR_PRESETS):
-                hex_val, name = COLOR_PRESETS[num - 1]
-                self._apply_color(hex_val)
-                self._toast(f"Accent: {name} ({hex_val})")
-                return
-            self._toast(f"Enter 1\u2013{len(COLOR_PRESETS)} or a HEX code")
-            return
-
-        # Parse HEX input
-        clean = raw.strip().lstrip("#")
-        if re.match(r"^[0-9a-fA-F]{6}$", clean):
-            hex_val = f"#{clean.lower()}"
-            self._apply_color(hex_val)
-            self._toast(f"Accent: {hex_val}")
-        else:
-            self._toast("Invalid HEX \u2014 use 6 digits (e.g. FF6B35)")
 
     def _apply_color(self, hex_val: str) -> None:
         self._accent = hex_val
@@ -3145,9 +2961,7 @@ if(matchMedia('(prefers-reduced-motion:reduce)').matches){
 
     def _update_placeholder(self) -> None:
         inp = self.query_one("#task-input", HistoryInput)
-        if self._update_notified and self._view_mode == "timeline":
-            inp.placeholder = "  Update available \u2014 type /update"
-        elif self.state == RUNNING:
+        if self.state == RUNNING:
             inp.placeholder = "  What are you working on?"
         elif self.state == PAUSED:
             inp.placeholder = "  Timer paused \u2014 /resume to continue"
@@ -3441,164 +3255,6 @@ if(matchMedia('(prefers-reduced-motion:reduce)').matches){
 
     # ── Auto-update ────────────────────────────────────────────────────────
 
-    def _send_update_notification(self, version: str) -> None:
-        """Send macOS notification about available update."""
-        self._system_notify(f"Update {version} available \u2014 type /update")
-
-    def _check_update_bg(self) -> None:
-        """Background check for newer version on GitHub."""
-        try:
-            resp = urllib.request.urlopen(CHANGELOG_URL, timeout=5, context=_SSL_CTX)
-            info = json.loads(resp.read().decode())
-            self._update_info = info
-            if info.get("version", VERSION) != VERSION:
-                self._update_notified = True
-                self.call_from_thread(self._update_placeholder)
-                self.call_from_thread(
-                    self._toast, f"Update available ({info['version']}) — /update", 5
-                )
-                self._send_update_notification(info["version"])
-        except Exception:
-            pass
-
-    def _cmd_update(self) -> None:
-        self._update_progress = -1
-        if self._update_info is None:
-            # Fetch changelog if not cached from startup check
-            self._enter_view("update", "  /back to return")
-            threading.Thread(target=self._fetch_changelog_bg, daemon=True).start()
-            return
-        info = self._update_info
-        if info.get("version", VERSION) == VERSION:
-            self._toast("Already up to date", 3)
-            return
-        # Only offer the keystroke that actually does something: a release that
-        # ships as a signed app cannot be applied by patching files in place.
-        hint = ("  /back to return" if info.get("dmg_required", True)
-                else "  Enter 1 to update • /back to return")
-        self._enter_view("update", hint)
-
-    def _fetch_changelog_bg(self) -> None:
-        try:
-            resp = urllib.request.urlopen(CHANGELOG_URL, timeout=5, context=_SSL_CTX)
-            info = json.loads(resp.read().decode())
-            self._update_info = info
-            if info.get("version", VERSION) == VERSION:
-                self.call_from_thread(self._toast, "Already up to date", 3)
-                self.call_from_thread(self._leave_view)
-            else:
-                self.call_from_thread(self._render_history)
-                inp = self.query_one("#task-input", HistoryInput)
-                hint = ("  /back to return" if info.get("dmg_required", True)
-                        else "  Enter 1 to update • /back to return")
-                self.call_from_thread(setattr, inp, "placeholder", hint)
-        except Exception as exc:
-            self.call_from_thread(self._toast, f"Cannot check for updates: {exc}", 5)
-            self.call_from_thread(self._leave_view)
-
-    def _render_update(self) -> None:
-        info = self._update_info
-        rows = []
-
-        if info is None:
-            rows.append(Text(""))
-            rows.append(Text.from_markup(f"  [{DIM}]Checking for updates...[/]"))
-            self.query_one("#history", Static).update(Group(*rows))
-            return
-
-        remote_ver = info.get("version", "?")
-        changes = info.get("changes", [])
-        dmg_required = info.get("dmg_required", True)
-
-        # Header: version
-        rows.append(self._space_between(
-            f"[bold {TEXT_COLOR}]Current version[/]",
-            f"[bold {DIM}]{VERSION}[/]",
-        ))
-        rows.append(self._space_between(
-            f"[bold {TEXT_COLOR}]New version[/]",
-            f"[bold {self._accent}]{remote_ver}[/]",
-        ))
-        rows.append(Text.from_markup(f"[{SEPARATOR}]{'─' * 50}[/]"))
-
-        # Changelog
-        rows.append(Text.from_markup(f"[bold {self._accent}]What's new[/]"))
-        rows.append(Text(""))
-        for change in changes:
-            rows.append(Text.from_markup(f"  [{TEXT_COLOR}]• {change}[/]"))
-        rows.append(Text(""))
-        rows.append(Text.from_markup(f"[{SEPARATOR}]{'─' * 50}[/]"))
-
-        # Progress bar / button / DMG message
-        if self._update_progress >= 0 and self._update_progress < 2:
-            # Progress bar
-            bar_w = 46
-            filled = int(bar_w * self._update_progress)
-            empty = bar_w - filled
-            bar = f"[{self._accent}]{'█' * filled}[/][{DIMMER}]{'░' * empty}[/]"
-            pct = int(self._update_progress * 100)
-            rows.append(Text.from_markup(f"  {bar} [{DIM}]{pct}%[/]"))
-        elif self._update_progress == 2:
-            rows.append(Text.from_markup(
-                f"  [bold {self._accent}]Update complete — reloading...[/]"
-            ))
-        elif dmg_required:
-            rows.append(Text.from_markup(
-                f"  [{TEXT_COLOR}]This update requires a new app download.[/]"
-            ))
-            rows.append(Text(""))
-            rows.append(Text.from_markup(
-                f"  [bold {self._accent}]→[/] [{TEXT_COLOR}]https://github.com/halinskiy/timex/releases/latest[/]"
-            ))
-        else:
-            rows.append(Text.from_markup(
-                f"[bold {self._accent}]1.[/] [{TEXT_COLOR}]Update to {remote_ver}[/]"
-            ))
-
-        self.query_one("#history", Static).update(Group(*rows))
-
-    def _select_update(self, raw: str) -> None:
-        if raw != "1":
-            return
-        info = self._update_info
-        if not info or info.get("dmg_required", True):
-            return
-        if self._update_progress >= 0:
-            return  # already updating
-        self._update_progress = 0
-        self._render_history()
-        threading.Thread(target=self._do_update, daemon=True).start()
-
-    def _do_update(self) -> None:
-        try:
-            app_dir = Path(__file__).parent
-            total = len(UPDATE_FILES)
-            for i, fname in enumerate(UPDATE_FILES):
-                url = f"{UPDATE_BASE_URL}/{fname}"
-                resp = urllib.request.urlopen(url, timeout=15, context=_SSL_CTX)
-                data = resp.read()
-                tmp_fd, tmp_path = tempfile.mkstemp(dir=app_dir, prefix=f".{fname}.")
-                try:
-                    os.write(tmp_fd, data)
-                finally:
-                    os.close(tmp_fd)
-                Path(tmp_path).replace(app_dir / fname)
-                self._update_progress = (i + 1) / total
-                self.call_from_thread(self._render_history)
-            self._update_progress = 2
-            self.call_from_thread(self._render_history)
-            _time.sleep(1)
-            self.call_from_thread(self._cmd_reload)
-        except Exception as exc:
-            self._update_progress = -1
-            self.call_from_thread(self._render_history)
-            self.call_from_thread(self._toast, f"Update failed: {exc}", 5)
-
-    def _cmd_reload(self) -> None:
-        """Reload the app — writes flag, exits; launcher watches and reloads."""
-        self._save_state()
-        (Path.home() / ".timex" / ".reload").touch()
-        self.exit()
 
     def action_quit(self) -> None:
         # Auto-pause on exit so no reminders fire while app is closed

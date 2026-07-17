@@ -15,7 +15,7 @@ Minimal time tracker for macOS. Dark TUI in a native window, keyboard-driven, no
   - an Excel workbook (.xlsx), also embedded in the page as a download
 - Session history by date, statistics
 - Automatic backups of every project's history
-- Customization: accent color (10 presets + custom HEX), timezone, reminder intervals
+- Customization: accent color and reminder interval via `~/.timex/config.json`
 - Menu bar widget showing timer status
 
 ## Reports
@@ -88,9 +88,7 @@ or a project). The last 30 snapshots are kept; restoring is a plain folder copy 
 | `/project` | Switch projects |
 | `/date` | Browse history |
 | `/stats` | View statistics |
-| `/color` | Change accent color |
 | `/notification` | Configure reminders |
-| `/update` | Check for a new version |
 | `/help` | Show help |
 
 ## Setup
