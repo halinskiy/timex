@@ -10,8 +10,6 @@ Minimal time tracker for macOS. Dark TUI in a native window, keyboard-driven, no
 
 - Timer with start / pause / resume
 - Multi-project support with independent histories
-- Watch mode — automatic activity tracking via screenshots or window focus detection
-- AI task labeling (analyzes screenshots to name tasks automatically)
 - Reports for a day, a week, a month or a custom range:
   - a self-contained HTML page that opens in a browser and can be sent to a client
   - an Excel workbook (.xlsx), also embedded in the page as a download
@@ -86,8 +84,7 @@ or a project). The last 30 snapshots are kept; restoring is a plain folder copy 
 | `/edit` | Rename or delete tasks |
 | `/add 30m` | Add time to session |
 | `/remove 10m` | Remove time from session |
-| `/track` | Auto-track activity |
-| `/export` | Report for a period: .html page or .xlsx |
+| `/export` | Report a period: visual .html page or .xlsx |
 | `/project` | Switch projects |
 | `/date` | Browse history |
 | `/stats` | View statistics |
@@ -104,9 +101,6 @@ or a project). The last 30 snapshots are kept; restoring is a plain folder copy 
 ```
 pip install textual rich textual-serve pywebview rumps openpyxl
 ```
-
-Optional (for AI task labeling):
-- Set `openai_api_key` in `~/.timex/config.json`
 
 ### Run
 
