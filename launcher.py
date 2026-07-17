@@ -60,10 +60,19 @@ def main() -> None:
         except OSError:
             menubar_proc = None  # no widget is bad; no app at all is worse
 
+    # Send stderr to a file, not a pipe: nothing reads the pipe once startup
+    # succeeds, so ~64 KB of server chatter would fill the buffer and block
+    # serve.py mid-write, hanging the whole app.
+    serve_log_path = os.path.join(os.path.expanduser("~"), ".timex", "serve.log")
+    try:
+        os.makedirs(os.path.dirname(serve_log_path), exist_ok=True)
+        serve_log = open(serve_log_path, "w")
+    except OSError:
+        serve_log = subprocess.DEVNULL
     server_proc = subprocess.Popen(
         [PYTHON, SERVE_PY, HOST, str(PORT)],
         stdout=subprocess.DEVNULL,
-        stderr=subprocess.PIPE,
+        stderr=serve_log,
     )
 
     for _ in range(40):
@@ -71,7 +80,11 @@ def main() -> None:
             break
         # Check if process crashed
         if server_proc.poll() is not None:
-            err = server_proc.stderr.read().decode() if server_proc.stderr else ""
+            try:
+                with open(serve_log_path) as fh:
+                    err = fh.read()
+            except OSError:
+                err = ""
             print(f"Timex: server crashed\n{err}", file=sys.stderr)
             if menubar_proc:
                 menubar_proc.kill()
@@ -189,27 +202,6 @@ def main() -> None:
         """)
 
     window.events.loaded += on_loaded
-
-    # Watch for /reload flag and reload the webview
-    import threading
-
-    def _reload_watcher():
-        reload_flag = os.path.join(os.path.expanduser("~"), ".timex", ".reload")
-        while True:
-            time.sleep(0.3)
-            if os.path.exists(reload_flag):
-                try:
-                    os.remove(reload_flag)
-                except OSError:
-                    pass
-                time.sleep(0.5)  # let textual-serve start fresh subprocess
-                try:
-                    window.load_url(f"http://{HOST}:{PORT}/?fontsize=12")
-                except Exception:
-                    pass
-
-    t = threading.Thread(target=_reload_watcher, daemon=True)
-    t.start()
 
     try:
         webview.start()

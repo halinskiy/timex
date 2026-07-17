@@ -59,7 +59,7 @@ All data stored in `~/.timex/`:
 ~/.timex/
   state.json          # current session
   history.json        # completed sessions
-  config.json         # preferences
+  config.json         # preferences: accent_color, reminder_interval, report_name
   active_project      # current project name
   projects/           # per-project directories
     ProjectName/

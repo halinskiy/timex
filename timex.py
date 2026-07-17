@@ -76,7 +76,7 @@ AUTOSAVE_INTERVAL = 30  # seconds between autosaves during tick
 CONFIG_FILE = STATE_DIR / "config.json"
 CRASH_LOG = STATE_DIR / "crash.log"
 
-VERSION = "1.2.0"
+VERSION = "1.2.1"
 # Patching these in place rewrites files inside the bundle, which breaks the
 # notarised signature. Updates therefore ship as a fresh signed app: changelog
 # entries default to dmg_required, and self-patching is opt-in per release.
@@ -977,7 +977,10 @@ class TimexApp(App):
                 self._toast("Session renamed")
             else:
                 # Delete session
-                self._snapshot("session-delete")
+                if not self._snapshot("session-delete"):
+                    self._toast("Backup failed — session kept", 5)
+                    self._editing_session = None
+                    return
                 self._viewing_sessions.pop(idx)
                 self._save_sessions_to_history()
                 self._toast("Session deleted")
@@ -1400,7 +1403,7 @@ class TimexApp(App):
         days = len({t.wall_start.date() for t in tasks})
 
         rows = [Text.from_markup(
-            f"[bold {self._accent}]Report on Hours[/] [{DIM}]/ Kostiantyn Halynskyi for[/]"
+            f"[bold {self._accent}]Report on Hours[/] [{DIM}]/ {self._report_author()} for[/]"
             f" [{TEXT_COLOR}]{self._project}[/]"
         )]
         rows.append(Text.from_markup(f"[{SEPARATOR}]{'─' * 50}[/]"))
@@ -1497,11 +1500,35 @@ class TimexApp(App):
         durations = [self._task_secs(t, active) for t in tasks]
         return d_from, d_to, tasks, durations, sum(durations)
 
+    def _report_author(self) -> str:
+        """Name the report is signed with.
+
+        Set `report_name` in config.json; otherwise fall back to the macOS
+        account's full name, so someone else's export is not signed with mine.
+        """
+        try:
+            cfg = json.loads(CONFIG_FILE.read_text()) if CONFIG_FILE.exists() else {}
+            name = str(cfg.get("report_name") or "").strip()
+            if name:
+                return name
+        except (OSError, json.JSONDecodeError, TypeError, ValueError):
+            pass
+        try:
+            import pwd
+            full = pwd.getpwuid(os.getuid()).pw_gecos.split(",")[0].strip()
+            if full:
+                return full
+        except Exception:
+            pass
+        return "Timex"
+
     def _export_filename(self, d_from: date, d_to: date, ext: str) -> str:
         stamp = (d_from.strftime("%Y%m%d") if d_from == d_to
                  else f"{d_from.strftime('%Y%m%d')}-{d_to.strftime('%Y%m%d')}")
         slug = re.sub(r"[^a-z0-9]+", "_", (self._project or "timex").lower()).strip("_")
-        return f"halynskyi_{slug}_{stamp}.{ext}"
+        parts = self._report_author().split()
+        who = re.sub(r"[^a-z0-9]+", "_", (parts[-1] if parts else "timex").lower()).strip("_")
+        return f"{who or 'timex'}_{slug}_{stamp}.{ext}"
 
     def _top_tasks(self, tasks, durations, total, limit: int) -> list[tuple]:
         """(name, seconds, share) for the biggest tasks, largest first.
@@ -1940,7 +1967,7 @@ if(matchMedia('(prefers-reduced-motion:reduce)').matches){
             f"<title>{e(title)}</title><style>{self._REPORT_CSS}</style></head>"
             f'<body><div id="tip"></div><div class="wrap">'
             f'<div class="brand">⏱ Timex</div><h1>Report on Hours</h1>'
-            f'<div class="sub">Kostiantyn Halynskyi · {e(self._project or "Timex")} · '
+            f'<div class="sub">{e(self._report_author())} · {e(self._project or "Timex")} · '
             f"{e(period)}</div>"
             f'<div class="rule"></div><div class="tiles">{tiles_html}</div>'
             f'<div class="rule"></div><h2>Longest tasks</h2>'
@@ -2070,7 +2097,13 @@ if(matchMedia('(prefers-reduced-motion:reduce)').matches){
             self._toast("Usage: /remove 10min, /remove 1h, /remove 30s")
             return
 
-        # Removing time = increasing total_paused
+        # Removing time = increasing total_paused. Cap it at what is actually on
+        # the clock: overshooting used to be masked by max(0, ...) in the display
+        # and then silently eaten from the next hours worked.
+        available = self._active_seconds()
+        if total > available:
+            self._toast(f"Only {self._fmt_time(available)} on the clock")
+            return
         self.total_paused += timedelta(seconds=total)
 
         h, rem = divmod(int(total), 3600)
@@ -2677,7 +2710,11 @@ if(matchMedia('(prefers-reduced-motion:reduce)').matches){
             if name:
                 target = PROJECTS_DIR / name
                 if target.exists():
-                    self._snapshot("project-delete")
+                    if not self._snapshot("project-delete"):
+                        self._toast("Backup failed — project kept", 5)
+                        self._project_to_delete = None
+                        self._enter_view("project_edit", "  ↑/↓ to select • Enter to rename • /back")
+                        return
                     shutil.rmtree(target)
                 # If deleted current project, switch to another
                 if self._project == name:
@@ -3054,29 +3091,31 @@ if(matchMedia('(prefers-reduced-motion:reduce)').matches){
 
     # ── Backups ──────────────────────────────────────────────────────────
 
-    def _snapshot(self, tag: str, once_per_day: bool = False) -> None:
+    def _snapshot(self, tag: str, once_per_day: bool = False) -> bool:
         """Copy the projects tree aside before anything can destroy it.
 
         history.json is the only record a session ever gets, so a delete or a bad
         write is otherwise final. Restoring is a plain folder copy back.
+        Returns False if the copy failed, so callers can refuse to destroy.
         """
         try:
             if not PROJECTS_DIR.exists() or not any(PROJECTS_DIR.iterdir()):
-                return
+                return True  # nothing to lose
             BACKUP_DIR.mkdir(parents=True, exist_ok=True)
             now = self._now()
             if once_per_day:
                 today = now.strftime("%Y%m%d")
                 for p in BACKUP_DIR.iterdir():
                     if p.is_dir() and p.name.startswith(today) and p.name.endswith(tag):
-                        return
+                        return True  # already snapshotted today
             shutil.copytree(PROJECTS_DIR,
                             BACKUP_DIR / f"{now.strftime('%Y%m%d-%H%M%S')}-{tag}")
             snaps = sorted(p for p in BACKUP_DIR.iterdir() if p.is_dir())
             for old in snaps[:-BACKUP_KEEP]:
                 shutil.rmtree(old, ignore_errors=True)
+            return True
         except OSError:
-            pass  # a backup must never take the app down with it
+            return False  # never take the app down, but never claim success either
 
     _history_cache: list[dict] | None = None
     _history_cache_mtime: float = 0.0
