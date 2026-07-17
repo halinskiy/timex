@@ -11,7 +11,6 @@ Commands:
     /resume  — Resume the timer
     /new     — Save the session and start fresh
     /export  — Report a period: .html page or .xlsx
-    /clear   — Discard the current session
     <text>   — Log a new task (while timer is running)
 """
 
@@ -77,7 +76,7 @@ AUTOSAVE_INTERVAL = 30  # seconds between autosaves during tick
 CONFIG_FILE = STATE_DIR / "config.json"
 CRASH_LOG = STATE_DIR / "crash.log"
 
-VERSION = "1.3.2"
+VERSION = "1.3.3"
 # Patching these in place rewrites files inside the bundle, which breaks the
 # notarised signature. Updates therefore ship as a fresh signed app: changelog
 # entries default to dmg_required, and self-patching is opt-in per release.
@@ -132,9 +131,9 @@ class TaskEntry:
 # ── Command suggestions ──────────────────────────────────────────────────────
 
 STATE_COMMANDS: dict[str, list[str]] = {
-    IDLE:    ["/start", "/new", "/date", "/stats", "/export", "/edit", "/clear", "/help", "/notification", "/project"],
-    RUNNING: ["/pause", "/add", "/remove", "/reset", "/new", "/clear", "/date", "/stats", "/export", "/edit", "/help", "/notification", "/project"],
-    PAUSED:  ["/resume", "/add", "/remove", "/reset", "/new", "/clear", "/date", "/stats", "/export", "/edit", "/help", "/notification", "/project"],
+    IDLE:    ["/start", "/new", "/date", "/stats", "/export", "/edit", "/help", "/notification", "/project"],
+    RUNNING: ["/pause", "/add", "/remove", "/reset", "/new", "/date", "/stats", "/export", "/edit", "/help", "/notification", "/project"],
+    PAUSED:  ["/resume", "/add", "/remove", "/reset", "/new", "/date", "/stats", "/export", "/edit", "/help", "/notification", "/project"],
 }
 
 
@@ -1060,11 +1059,41 @@ class TimexApp(App):
             inp.styles.border = ("tall", self._waiting_border_color())
         else:
             inp.styles.border = ("tall", self._accent)
-        today = self._now().strftime("%a, %b %d %Y")
-        parts = [f"[{DIM}]{today}[/]"]
-        footer = Text.from_markup("  ".join(parts))
+
+        footer = self._command_hints(inp.value)
+        if footer is None:
+            today = self._now().strftime("%a, %b %d %Y")
+            footer = Text.from_markup(f"[{DIM}]{today}[/]")
         footer.justify = "center"
         self.query_one("#footer-bar", Static).update(footer)
+
+    def _command_hints(self, value: str) -> "Text | None":
+        """Every command matching what's typed, so all of them are visible.
+
+        The ghost text can only complete one command, so an ambiguous prefix like
+        "/e" hides the rest. This row lights them all up: "/edit /export".
+        """
+        # A bare "/" matches every command and overflows the narrow footer; wait
+        # for the first letter, where a prefix narrows it to at most a few.
+        if len(value) < 2 or not value.startswith("/") or self._view_mode != "timeline":
+            return None
+        val = value.lower()
+        commands = STATE_COMMANDS.get(self.state, STATE_COMMANDS[IDLE])
+        matches = [c for c in commands if c.startswith(val)]
+        if not matches:
+            return Text.from_markup(f"[{DIM}]no command matches {value}[/]")
+        pre = len(value)
+        chips = [
+            f"[{self._accent}]{c[:pre]}[/][{TEXT_COLOR}]{c[pre:]}[/]"
+            for c in sorted(matches)
+        ]
+        return Text.from_markup("   ".join(chips))
+
+    @on(Input.Changed)
+    def _on_input_changed(self, event: Input.Changed) -> None:
+        # Refresh the hint row on every keystroke, not just on the 0.5s tick.
+        if self._view_mode == "timeline":
+            self._render_footer()
 
     # ── Input handling ───────────────────────────────────────────────────
 
@@ -1120,8 +1149,6 @@ class TimexApp(App):
             self._cmd_export()
         elif cmd == "/new":
             self._cmd_new()
-        elif cmd == "/clear":
-            self._cmd_clear()
         elif cmd.startswith("/add"):
             self._cmd_add_time(raw)
         elif cmd.startswith("/remove"):
@@ -2081,18 +2108,6 @@ if(matchMedia('(prefers-reduced-motion:reduce)').matches){
         self._save_state()
         self._toast(f"Saved {n_tasks} tasks, {self._fmt_time(active)}")
 
-    def _cmd_clear(self) -> None:
-        self.state = IDLE
-        self.tasks = []
-        self._last_session_tasks = []
-        self.session_start = None
-        self.paused_at = None
-        self.total_paused = timedelta()
-        self._final_active = 0.0
-        self._update_placeholder()
-        self._mark_dirty()
-        self._save_state()
-        self._toast("Cleared")
 
     def _cmd_add_time(self, raw: str) -> None:
         if self.state == IDLE:
@@ -2173,7 +2188,6 @@ if(matchMedia('(prefers-reduced-motion:reduce)').matches){
             ("/date", "Browse past sessions by date"),
             ("/stats", "Weekly and monthly statistics"),
             ("/export", "Report a period: visual .html page or .xlsx"),
-            ("/clear", "Discard current session without saving"),
             ("/notification", "Set reminder interval"),
             ("/reset", "Reset session (discard without saving)"),
             ("/project", "Switch project"),
