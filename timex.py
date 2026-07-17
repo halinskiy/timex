@@ -9,9 +9,9 @@ Commands:
     /start   — Start the timer
     /pause   — Pause the timer
     /resume  — Resume the timer
-    /stop    — Stop the timer
-    /export  — Export to Sheets or Excel
-    /clear   — Clear session data
+    /new     — Save the session and start fresh
+    /export  — Report a period: .html page or .xlsx
+    /clear   — Discard the current session
     <text>   — Log a new task (while timer is running)
 """
 
@@ -23,7 +23,6 @@ import json
 import logging
 import os
 import subprocess
-import sys
 import threading
 import time as _time
 import traceback
@@ -37,7 +36,7 @@ import shutil
 import ssl
 import tempfile
 import urllib.request
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 from textual.app import App, ComposeResult
 from textual.containers import VerticalScroll
@@ -90,10 +89,9 @@ BACKUP_KEEP = 30  # the whole tree is ~200 KB, so keeping a month of them is fre
 ACTIVE_PROJECT_FILE = STATE_DIR / "active_project"
 AUTOSAVE_INTERVAL = 30  # seconds between autosaves during tick
 CONFIG_FILE = STATE_DIR / "config.json"
-AI_USAGE_FILE = STATE_DIR / "ai_usage.json"
 CRASH_LOG = STATE_DIR / "crash.log"
 
-VERSION = "1.1.0"
+VERSION = "1.1.1"
 # Patching these in place rewrites files inside the bundle, which breaks the
 # notarised signature. Updates therefore ship as a fresh signed app: changelog
 # entries default to dmg_required, and self-patching is opt-in per release.
@@ -151,7 +149,6 @@ class TaskEntry:
     active_start: float          # active seconds at task start
     active_end: float | None = None   # active seconds at task end
     wall_end: datetime | None = None  # wall clock when task ended
-    watched: bool = False        # True if watch was active for this task
 
     def get_duration(self, current_active: float | None = None) -> float:
         end = self.active_end if self.active_end is not None else (current_active or self.active_start)
@@ -175,8 +172,8 @@ class TaskEntry:
 
 STATE_COMMANDS: dict[str, list[str]] = {
     IDLE:    ["/start", "/new", "/date", "/stats", "/export", "/edit", "/clear", "/help", "/timezone", "/notification", "/color", "/project", "/update", "/reload"],
-    RUNNING: ["/pause", "/add", "/remove", "/sleep", "/track", "/reset", "/new", "/clear", "/date", "/stats", "/export", "/edit", "/help", "/timezone", "/notification", "/color", "/project", "/update", "/reload"],
-    PAUSED:  ["/resume", "/track", "/reset", "/new", "/clear", "/date", "/stats", "/export", "/edit", "/help", "/timezone", "/notification", "/color", "/project", "/update", "/reload"],
+    RUNNING: ["/pause", "/add", "/remove", "/sleep", "/reset", "/new", "/clear", "/date", "/stats", "/export", "/edit", "/help", "/timezone", "/notification", "/color", "/project", "/update", "/reload"],
+    PAUSED:  ["/resume", "/add", "/remove", "/reset", "/new", "/clear", "/date", "/stats", "/export", "/edit", "/help", "/timezone", "/notification", "/color", "/project", "/update", "/reload"],
 }
 
 
@@ -361,45 +358,6 @@ class HistoryInput(Input):
         return False
 
 
-def _read_ai_usage() -> dict:
-    """Read AI usage stats from disk."""
-    try:
-        if AI_USAGE_FILE.exists():
-            return json.loads(AI_USAGE_FILE.read_text())
-    except (OSError, json.JSONDecodeError):
-        pass
-    return {"requests": 0, "cost": 0.0}
-
-
-def _bump_ai_usage() -> None:
-    """Increment AI request counter and estimated cost."""
-    data = _read_ai_usage()
-    data["requests"] = data.get("requests", 0) + 1
-    # GPT-4o-mini with low-detail image: ~$0.002 per request
-    data["cost"] = round(data.get("cost", 0.0) + 0.002, 4)
-    try:
-        STATE_DIR.mkdir(parents=True, exist_ok=True)
-        tmp = AI_USAGE_FILE.with_suffix(".tmp")
-        tmp.write_text(json.dumps(data, indent=2))
-        tmp.replace(AI_USAGE_FILE)
-    except OSError:
-        pass
-
-
-# ── Retry helper ────────────────────────────────────────────────────────────
-
-
-def _retry(fn, max_retries: int = 3, base_delay: float = 1.0):
-    """Retry fn with exponential backoff."""
-    for attempt in range(max_retries):
-        try:
-            return fn()
-        except Exception:
-            if attempt == max_retries - 1:
-                raise
-            _time.sleep(base_delay * (2 ** attempt))
-
-
 # ── Application ──────────────────────────────────────────────────────────────
 
 
@@ -554,36 +512,6 @@ class TimexApp(App):
         self._input_wait_t: float = 0.0  # 0.0=accent, 1.0=blue (smooth transition)
         self._sleep_at: float = 0.0  # monotonic time when /sleep should fire
 
-        # ── Watch (window activity monitor) ──
-        self._watch_mode: str | None = None        # "screenshot" | None
-        self._watch_window_id: int | None = None   # CGWindowID
-        self._watch_window_name: str | None = None  # "App — Title"
-        self._watch_pid: int | None = None         # target process PID
-        self._watch_thinking: bool = False         # in Thinking state
-        self._watch_prev_task: str | None = None   # task name to restore
-        self._watch_user_named: bool = False       # user manually named task during watch
-        self._watch_last_check: float = 0.0        # monotonic time of last check
-        self._watch_last_active: float = 0.0       # monotonic time of last activity
-        self._watch_last_pixels: bytes | None = None  # screenshot sample
-        self._watch_step: str = "mode"             # view step: "mode" | "window"
-        self._watch_windows: list[dict] = []       # cached window list
-        self._watch_activity: list[tuple[float, float]] = []  # (wall_ts, 1.0/0.0)
-        self._watch_focus_stats: dict[str, dict] = {}  # {app: {active, total, first_ts}}
-        self._watch_last_ai_check: float = 0.0     # monotonic time of last AI analysis
-        self._watch_last_ai_task: str = ""          # last task name from AI
-        self._watch_ai_pending: bool = False        # True while AI request in flight
-        self._watch_generation: int = 0              # incremented on stop; AI checks stale results
-        self._watch_app_changed_at: float = 0.0    # monotonic time of last app switch
-        # Activity measurement (intensity-based)
-        self._activity_log: list[dict] = []  # [{ts, kbd, mouse, click, scroll}] every 10s
-        self._activity_last_poll: float = 0.0
-        self._activity_prev_counters: dict = {}  # previous CGEvent counters
-        self._activity_focus_app: str = ""  # current frontmost app
-        self._activity_focus_start: float = 0.0  # when current app focus started
-        self._activity_focus_switches: int = 0  # app switches in window
-        self._watch_bg_running: bool = False              # True while bg check thread is running
-        self._watch_bg_result: tuple[bool, float] | None = None  # (is_active, change_pct) from bg thread
-        self._watch_used: bool = False                   # True if /watch was used this session
         
 
     # ── Compose ──────────────────────────────────────────────────────────
@@ -660,7 +588,9 @@ class TimexApp(App):
                 if color and re.match(r"^#[0-9a-fA-F]{6}$", color):
                     self._accent = color.lower()
                     self._accent_hex = color.lstrip("#").upper()
-        except (OSError, json.JSONDecodeError, KeyError):
+        # A hand-edited config must not stop the app from opening: int() on a
+        # non-numeric reminder_interval raises ValueError/TypeError.
+        except (OSError, json.JSONDecodeError, KeyError, ValueError, TypeError):
             pass
 
     @staticmethod
@@ -720,18 +650,6 @@ class TimexApp(App):
         m, s = divmod(s, 60)
         return f"{h:02d}:{m:02d}:{s:02d}"
 
-    @staticmethod
-    def _fmt_uptime(secs: int) -> str:
-        if secs >= 86400:
-            d = secs // 86400
-            h = (secs % 86400) // 3600
-            return f"{d}d {h}h"
-        if secs >= 3600:
-            h = secs // 3600
-            m = (secs % 3600) // 60
-            return f"{h}h {m}m"
-        m = secs // 60
-        return f"{m}m" if m > 0 else "<1m"
 
     # ── External state sync ─────────────────────────────────────────────
 
@@ -781,7 +699,6 @@ class TimexApp(App):
                 self._render_all()
                 self._check_reminder()
                 self._check_sleep()
-                self._check_watch()
                 now = _time.monotonic()
                 if now - self._last_autosave >= AUTOSAVE_INTERVAL:
                     self._last_autosave = now
@@ -912,10 +829,6 @@ class TimexApp(App):
             scroll.border_title = "Reset"
             self._render_confirm_reset()
             return
-        if self._view_mode == "watch":
-            scroll.border_title = "Watch"
-            self._render_watch()
-            return
         if self._view_mode == "update":
             scroll.border_title = "Update"
             self._render_update()
@@ -976,30 +889,18 @@ class TimexApp(App):
                 rows.append(Text.from_markup(f"[{SEPARATOR}]{'─' * 50}[/]"))
 
             is_thinking = task.name.startswith("\u23f3")
-            watch_live = task.watched and is_current and self._watch_mode is not None and self.state == RUNNING
-            watch_lost = getattr(self, '_watch_lost', False)
-            if watch_live and watch_lost:
-                watch_dot = f"[{self._accent}]○[/] "
-            elif watch_live:
-                watch_dot = f"[bold {self._accent}]◉[/] "
-            elif task.watched and is_current:
-                watch_dot = f"[{self._accent}]○[/] "
-            elif task.watched:
-                watch_dot = f"[{DIM}]○[/] "
-            else:
-                watch_dot = ""
             if is_current:
                 header = self._space_between(f"[{DIM}]{time_str}[/]", f"[bold {self._accent}]{dur} ◄[/]")
                 if is_thinking:
-                    name_line = Text.from_markup(f"{watch_dot}[italic {DIM}]{task.name}[/]")
+                    name_line = Text.from_markup(f"[italic {DIM}]{task.name}[/]")
                 else:
-                    name_line = Text.from_markup(f"{watch_dot}[bold {TEXT_COLOR}]{task.name}[/]")
+                    name_line = Text.from_markup(f"[bold {TEXT_COLOR}]{task.name}[/]")
             else:
                 header = self._space_between(f"[{DIM}]{time_str}[/]", f"[#888888]{dur}[/]")
                 if is_thinking:
-                    name_line = Text.from_markup(f"{watch_dot}[italic {DIM}]{task.name}[/]")
+                    name_line = Text.from_markup(f"[italic {DIM}]{task.name}[/]")
                 else:
-                    name_line = Text.from_markup(f"{watch_dot}[{TEXT_COLOR}]{task.name}[/]")
+                    name_line = Text.from_markup(f"[{TEXT_COLOR}]{task.name}[/]")
 
             rows.append(header)
             rows.append(name_line)
@@ -1103,7 +1004,6 @@ class TimexApp(App):
             return
         self._view_mode = "history_detail"
         self._viewing_tasks = tasks
-        self._viewing_session_idx = num - 1
         self._render_history()
         inp = self.query_one("#task-input", HistoryInput)
         inp.placeholder = "  /edit to manage \u2022 /back to sessions"
@@ -1265,13 +1165,6 @@ class TimexApp(App):
             inp.styles.border = ("tall", self._accent)
         today = self._now().strftime("%a, %b %d %Y")
         parts = [f"[{DIM}]{today}[/]"]
-        if self._watch_mode is not None:
-            if self._watch_thinking:
-                parts.append(f"[italic {DIM}]track: thinking[/]")
-            elif self._watch_ai_pending:
-                parts.append(f"[{DIM}]track: [{self._accent}]analyzing...[/][/]")
-            else:
-                parts.append(f"[{DIM}]track: [{self._accent}]active[/][/]")
         footer = Text.from_markup("  ".join(parts))
         footer.justify = "center"
         self.query_one("#footer-bar", Static).update(footer)
@@ -1357,8 +1250,6 @@ class TimexApp(App):
             self._cmd_update()
         elif cmd == "/project":
             self._cmd_project()
-        elif cmd == "/track":
-            self._cmd_track()
         elif self._view_mode == "edit":
             self._submit_edit(raw)
         elif self._view_mode == "dates" and raw.isdigit():
@@ -1381,8 +1272,6 @@ class TimexApp(App):
             self._select_confirm_delete_project(raw)
         elif self._view_mode == "confirm_reset":
             self._select_confirm_reset(raw)
-        elif self._view_mode == "watch":
-            self._select_watch(raw)
         elif self._view_mode == "update":
             self._select_update(raw)
         elif self._view_mode == "export":
@@ -1412,7 +1301,7 @@ class TimexApp(App):
             self.paused_at = None
             self.total_paused = timedelta()
             self._final_active = 0.0
-            self._stop_watch()
+            self._sleep_at = 0.0  # ditto: the old deadline dies with the old session
             self._view_mode = "timeline"
             self._save_state()  # persist clean state first
             if entry:
@@ -1506,17 +1395,6 @@ class TimexApp(App):
         self.paused_at = None
         self.state = RUNNING
 
-        # Restart watch timing so it doesn't think user was inactive
-        if self._watch_mode is not None:
-            now = _time.monotonic()
-            self._watch_last_check = now
-            self._watch_last_active = now
-            self._watch_last_pixels = None
-            self._watch_last_ai_check = now - 170.0
-            self._watch_ai_pending = False
-            self._watch_bg_running = False
-            self._watch_bg_result = None
-
         self._reset_reminder()
         self._toast("Timer resumed")
         self._update_placeholder()
@@ -1555,9 +1433,6 @@ class TimexApp(App):
             self.total_paused = timedelta()
             self._final_active = 0.0
             self._sleep_at = 0.0
-            self._watch_thinking = False
-            self._watch_prev_task = None
-            self._watch_focus_stats = {}
             self._leave_view("Session reset")
             self._save_state()
         else:
@@ -1565,863 +1440,8 @@ class TimexApp(App):
 
     # ── Watch (window activity monitor) ───────────────────────────────────
 
-    def _cmd_track(self) -> None:
-        if self.state == IDLE:
-            # Auto-start timer so track can begin immediately
-            self.state = RUNNING
-            self.session_start = self._now()
-            self.total_paused = timedelta()
-            self.paused_at = None
-            self._final_active = 0.0
-            self.tasks = []
-            self._reset_reminder()
-            self._save_state()
-        self._watch_used = True
-        self._watch_step = "window"
-        self._watch_windows = self._get_window_list()
-        self._enter_view("watch", "  Enter number \u2022 /back to return")
-
-    @staticmethod
-    def _get_input_idle() -> float:
-        """Seconds since last keyboard press (most reliable activity signal)."""
-        try:
-            from Quartz import CGEventSourceSecondsSinceLastEventType, kCGEventSourceStateCombinedSessionState
-            return CGEventSourceSecondsSinceLastEventType(kCGEventSourceStateCombinedSessionState, 10)
-        except Exception:
-            return -1.0
-
-    def _poll_activity(self) -> None:
-        """Sample input event counters every 10s. Compute deltas."""
-        try:
-            from Quartz import (
-                CGEventSourceCounterForEventType,
-                kCGEventSourceStateCombinedSessionState,
-            )
-            import AppKit as _AK
-        except ImportError:
-            return
-
-        now = _time.time()
-        if now - self._activity_last_poll < 10.0:
-            return
-        self._activity_last_poll = now
-
-        # Read cumulative counters
-        counters = {
-            "kbd": CGEventSourceCounterForEventType(kCGEventSourceStateCombinedSessionState, 10),   # keyDown
-            "mouse": CGEventSourceCounterForEventType(kCGEventSourceStateCombinedSessionState, 5),   # mouseMoved
-            "click": CGEventSourceCounterForEventType(kCGEventSourceStateCombinedSessionState, 1),   # leftMouseDown
-            "scroll": CGEventSourceCounterForEventType(kCGEventSourceStateCombinedSessionState, 22),  # scrollWheel
-        }
-
-        # Track app focus
-        try:
-            front = _AK.NSWorkspace.sharedWorkspace().frontmostApplication()
-            app_name = front.localizedName() or "" if front else ""
-        except Exception:
-            app_name = ""
-
-        if app_name and app_name != self._activity_focus_app:
-            self._activity_focus_switches += 1
-            self._activity_focus_app = app_name
-            self._activity_focus_start = now
-
-        # Compute deltas (skip first poll — no previous data)
-        if self._activity_prev_counters:
-            entry = {
-                "ts": now,
-                "kbd": max(0, counters["kbd"] - self._activity_prev_counters["kbd"]),
-                "mouse": max(0, counters["mouse"] - self._activity_prev_counters["mouse"]),
-                "click": max(0, counters["click"] - self._activity_prev_counters["click"]),
-                "scroll": max(0, counters["scroll"] - self._activity_prev_counters["scroll"]),
-            }
-            self._activity_log.append(entry)
-            # Keep last 15 minutes (90 entries × 10s)
-            if len(self._activity_log) > 90:
-                self._activity_log = self._activity_log[-90:]
-
-        self._activity_prev_counters = counters
-
-    def _compute_activity_level(self) -> tuple[int, str]:
-        """Intensity-based activity: keyboard + mouse normalized to baselines.
-
-        Keyboard baseline: ~50 keys/min → ~8 keys/10s tick
-        Mouse baseline: click+scroll ~15/min → ~2.5/10s tick
-        """
-        self._poll_activity()
-
-        now = _time.time()
-
-        def _intensity(window_sec: int) -> tuple[int, int, int]:
-            """Return (kbd%, mouse%, combined%) for a time window."""
-            cutoff = now - window_sec
-            ticks = [e for e in self._activity_log if e["ts"] >= cutoff]
-            if not ticks:
-                return 0, 0, 0
-            n = len(ticks)
-
-            # Keyboard: normalize to ~8 keystrokes per 10s tick
-            kbd_per_tick = sum(e["kbd"] for e in ticks) / n
-            kbd_pct = min(100, int(kbd_per_tick / 8.0 * 100))
-
-            # Mouse: clicks + scrolls, normalize to ~2.5 per 10s tick
-            mouse_per_tick = sum(e["click"] + e["scroll"] for e in ticks) / n
-            mouse_pct = min(100, int(mouse_per_tick / 2.5 * 100))
-
-            # Combined: weighted average (keyboard matters more for work)
-            combined = int(kbd_pct * 0.6 + mouse_pct * 0.4)
-            return kbd_pct, mouse_pct, combined
-
-        _, _, p1 = _intensity(60)
-        kbd5, mouse5, p5 = _intensity(300)
-        kbd10, mouse10, p10 = _intensity(600)
-
-        # Focus bonus: sustained app focus boosts score slightly
-        focus_dur = now - self._activity_focus_start if self._activity_focus_start else 0
-        focus_min = min(focus_dur / 60, 30)  # cap at 30 min
-        focus_bonus = int(focus_min / 30 * 15)  # up to +15%
-
-        level = min(100, p10 + focus_bonus)
-
-        breakdown = f"kbd: {kbd10}%  ·  mouse: {mouse10}%  ·  focus: {int(focus_min)}m"
-
-        return level, breakdown
-
-    def _render_watch(self) -> None:
-        rows = []
-
-        if self._watch_step == "window":
-            if not self._watch_windows:
-                self._watch_windows = self._get_window_list()
-            rows.append(Text.from_markup(
-                f"[bold {TEXT_COLOR}]Select window to track:[/]"
-            ))
-            if self._watch_mode is not None:
-                rows.append(Text.from_markup(f"[{SEPARATOR}]{'─' * 50}[/]"))
-                rows.append(Text.from_markup(
-                    f"[bold {self._accent}]0.[/] [{TEXT_COLOR}]Off[/]  [{DIM}]({self._watch_window_name or 'active'})[/]"
-                ))
-            max_up = max((w["uptime"] for w in self._watch_windows), default=0)
-            for i, win in enumerate(self._watch_windows, start=1):
-                rows.append(Text.from_markup(f"[{SEPARATOR}]{'─' * 50}[/]"))
-                if win['title'] and win['title'] != win['app']:
-                    name_part = f"[{TEXT_COLOR}]{win['app']}[/] [{DIM}]— {win['title']}[/]"
-                else:
-                    name_part = f"[{TEXT_COLOR}]{win['app']}[/]"
-                up = win.get("uptime", 0)
-                bar_w = 8
-                filled = max(0, round(up / max_up * bar_w)) if max_up > 0 and up > 0 else 0
-                empty = bar_w - filled
-                bar = f"[{self._accent}]{'█' * filled}[/][#333]{'░' * empty}[/]"
-                up_str = self._fmt_uptime(up)
-                rows.append(Text.from_markup(
-                    f"[bold {self._accent}]{i}.[/] {name_part}"
-                ))
-                rows.append(Text.from_markup(
-                    f"   {bar} [{DIM}]{up_str}[/]"
-                ))
-            if not self._watch_windows:
-                rows.append(Text.from_markup(f"  [{DIM}]No suitable windows found[/]"))
-
-        self.query_one("#history", Static).update(Group(*rows))
-
-    def _select_watch(self, raw: str) -> None:
-        if not raw.isdigit():
-            self._toast("Enter a number")
-            return
-        num = int(raw)
-        # 0 = turn off (only when track is active)
-        if num == 0 and self._watch_mode is not None:
-            self._stop_watch()
-            self._leave_view("Track stopped")
-            return
-        if num < 1 or num > len(self._watch_windows):
-            max_n = len(self._watch_windows)
-            self._toast(f"Enter 1\u2013{max_n}" if max_n else "No windows")
-            return
-        win = self._watch_windows[num - 1]
-        self._watch_mode = "screenshot"
-        self._watch_window_id = win["id"]
-        self._watch_window_name = f"{win['app']} \u2014 {win['title']}"
-        self._watch_pid = win["pid"]
-        self._start_watch()
-        self._leave_view(f"Track: {self._watch_window_name}")
-
-    def _start_watch(self) -> None:
-        now = _time.monotonic()
-        self._watch_last_check = now
-        self._watch_last_active = now
-        self._watch_thinking = False
-        self._watch_prev_task = None
-        self._watch_last_pixels = None
-        self._watch_activity = []
-        self._watch_focus_stats = {}
-        self._watch_last_ai_check = _time.monotonic() - 175.0  # first AI check after ~5s
-        self._watch_last_ai_task = ""
-        self._watch_ai_pending = False
-        self._activity_log = []
-        self._activity_last_poll = 0.0
-        self._activity_prev_counters = {}
-        self._activity_focus_app = ""
-        self._activity_focus_start = 0.0
-        self._activity_focus_switches = 0
-        self._watch_bg_running = False
-        self._watch_bg_result = None
-        self._watch_lost = False
-        self._watch_ss_change_count = 0
-        self._watch_same_streak = 0
-        self._watch_stale_notified = False
-        self._watch_prompt_last_notify = 0.0   # monotonic time of last prompt check
-        # Mark current task as watched
-        if self.tasks and self.tasks[-1].active_end is None:
-            self.tasks[-1].watched = True
-        # Create initial "thinking" task — AI will replace it with real name
-        self._add_task("\u23f3 ...")
-        self._save_state()
-        self._mark_dirty()
-
-    def _stop_watch(self) -> None:
-        # Remove any placeholder/thinking task (⏳ ... or ⏳ Thinking)
-        if self.tasks and self.tasks[-1].name.startswith("\u23f3"):
-            self.tasks.pop()
-            # Reopen previous task (undo its finalization)
-            if self.tasks and self.tasks[-1].active_end is not None:
-                self.tasks[-1].active_end = None
-                self.tasks[-1].wall_end = None
-            self._watch_thinking = False
-            self._mark_dirty()
-            self._save_state()
-        self._watch_generation += 1
-        self._watch_mode = None
-        self._watch_window_id = None
-        self._watch_window_name = None
-        self._watch_pid = None
-        self._watch_last_pixels = None
-        self._watch_prev_task = None
-        self._watch_thinking = False
-        self._watch_user_named = False
-        self._watch_windows = []
-        self._watch_focus_stats = {}
-        self._watch_bg_running = False
-        self._watch_bg_result = None
-        self._watch_lost = False
-
-    def _check_watch(self) -> None:
-        if self._watch_mode is None or self.state != RUNNING:
-            return
-
-        # Always collect activity data (even when not on /watch screen)
-        self._poll_activity()
-
-        # Consume result from background thread
-        if self._watch_bg_result is not None:
-            is_active, change_pct = self._watch_bg_result
-            self._watch_bg_result = None
-            self._process_watch_result(is_active, change_pct)
-
-        # Launch new check every 5s (skip if bg thread still running)
-        now = _time.monotonic()
-        if now - self._watch_last_check < 5.0 or self._watch_bg_running:
-            return
-        self._watch_last_check = now
-
-        # Run heavy screenshot/focus work in background thread
-        wmode = self._watch_mode  # snapshot before thread start
-        def _bg_check():
-            try:
-                if wmode == "screenshot":
-                    result = self._check_watch_screenshot()
-                else:
-                    result = (True, -1.0)
-                self._watch_bg_result = result
-            except Exception:
-                self._watch_bg_result = (True, -1.0)
-            finally:
-                self._watch_bg_running = False
-
-        self._watch_bg_running = True
-        threading.Thread(target=_bg_check, daemon=True).start()
-
-    def _process_watch_result(self, is_active: bool, change_pct: float) -> None:
-        """Process watch check result (called on main thread)."""
-        # Log activity
-        wall_ts = _time.time()
-        self._watch_activity.append((wall_ts, 1.0 if is_active else 0.0))
-        if len(self._watch_activity) > 450:
-            self._watch_activity = self._watch_activity[-450:]
-
-        now = _time.monotonic()
-        if is_active:
-            self._watch_last_active = now
-            self._watch_stale_notified = False
-            if self._watch_thinking:
-                # Stale thinking (⏳ ...) — let AI rename it, just exit thinking state
-                if self.tasks and self.tasks[-1].name == "\u23f3 ...":
-                    self._watch_thinking = False
-                    self._watch_same_streak = 0
-                    # Force early AI check to rename quickly
-                    self._watch_last_ai_check = _time.monotonic() - 170.0
-                    self._mark_dirty()
-                    self._save_state()
-                else:
-                    # Inactivity thinking (⏳ Thinking) — remove and reopen previous
-                    if self.tasks and self.tasks[-1].name.startswith("\u23f3"):
-                        self.tasks.pop()
-                        if self.tasks and self.tasks[-1].active_end is not None:
-                            self.tasks[-1].active_end = None
-                            self.tasks[-1].wall_end = None
-                    self._watch_thinking = False
-                    self._watch_prev_task = None
-                    self._mark_dirty()
-                    self._save_state()
-        else:
-            inactive_secs = now - self._watch_last_active
-            if not self._watch_thinking and inactive_secs >= 600.0:
-                self._watch_thinking = True
-                if self.tasks and self.tasks[-1].active_end is None:
-                    self._watch_prev_task = self.tasks[-1].name
-                self._add_task("\u23f3 Thinking")
-            # 15 min stale → notify user (once)
-            if self._watch_thinking and inactive_secs >= 900.0:
-                if not getattr(self, '_watch_stale_notified', False):
-                    self._watch_stale_notified = True
-                    self._system_notify("Code: Waiting for action")
-
-    def _check_watch_screenshot(self) -> tuple[bool, float]:
-        """Screenshot mode: watch a specific window (e.g. coding agent).
-
-        Triggers AI when visual content changes significantly.
-        Adapts frequency: more often when screen is changing, less when static.
-        """
-        try:
-            from Quartz import (
-                CGWindowListCreateImage,
-                CGRectNull,
-                kCGWindowListOptionIncludingWindow,
-                kCGWindowImageBoundsIgnoreFraming,
-                CGImageGetDataProvider,
-                CGDataProviderCopyData,
-            )
-        except ImportError:
-            self.call_from_thread(self._toast, "Quartz not available")
-            self.call_from_thread(self._stop_watch)
-            return True, -1.0
-
-        if self._watch_window_id is None:
-            self._watch_lost = True
-            return True, -1.0
-
-        image = CGWindowListCreateImage(
-            CGRectNull,
-            kCGWindowListOptionIncludingWindow,
-            self._watch_window_id,
-            kCGWindowImageBoundsIgnoreFraming,
-        )
-        if image is None:
-            self._watch_lost = True
-            return True, -1.0
-
-        self._watch_lost = False  # window is back
-        provider = CGImageGetDataProvider(image)
-        if provider is None:
-            return True, -1.0
-        pixel_data = CGDataProviderCopyData(provider)
-        if pixel_data is None or len(pixel_data) == 0:
-            return True, -1.0
-
-        # Sample a small contiguous region from the middle (2KB)
-        data_len = len(pixel_data)
-        sample_size = 2048
-        mid = data_len // 2
-        start = max(0, mid - sample_size // 2)
-        sampled = bytes(pixel_data[start:start + sample_size])
-
-        if self._watch_last_pixels is None:
-            self._watch_last_pixels = sampled
-            is_active = True
-            pct = 0.0
-        else:
-            changed = sum(1 for a, b in zip(self._watch_last_pixels, sampled) if abs(a - b) > 8)
-            self._watch_last_pixels = sampled
-            total = len(sampled)
-            pct = changed / total if total > 0 else 0.0
-            is_active = pct > 0.003
-
-        # Check user input (keyboard/mouse idle)
-        user_idle = self._get_input_idle()
-        user_active = 0 <= user_idle < 30.0  # user touched input in last 30s
-
-        # AI trigger logic:
-        # - Screen changing (agent working) → check every 60s
-        # - Screen static + user idle → no check (waiting/thinking)
-        # - Screen static + user active → check every 120s (user reading/reviewing)
-        # - Cumulative visual changes since last AI → trigger early
-        app_name = self._watch_window_name or "Unknown"
-        mono_now = _time.monotonic()
-        elapsed_ai = mono_now - self._watch_last_ai_check
-
-        if is_active:
-            # Screen is changing — track cumulative changes
-            self._watch_ss_change_count += 1
-        else:
-            # Screen static — check for prompt/dialog every 30s via OCR
-            since_last = mono_now - self._watch_prompt_last_notify if self._watch_prompt_last_notify else 999.0
-            if since_last >= 30.0:
-                threading.Thread(
-                    target=self._check_prompt_dialog, args=(image,), daemon=True,
-                ).start()
-
-        # Determine AI interval based on state (~10 calls/hour ≈ $0.50/day budget)
-        if is_active and elapsed_ai >= 300.0:
-            # Screen changing → 5 min interval
-            should_trigger = True
-        elif not is_active and user_active and elapsed_ai >= 420.0:
-            # Static screen but user is active (reviewing) → 7 min
-            should_trigger = True
-        elif elapsed_ai >= 600.0:
-            # Fallback: at least every 10 min
-            should_trigger = True
-        elif self._watch_ss_change_count >= 20 and elapsed_ai >= 180.0:
-            # Lots of visual changes accumulated → trigger after 3 min
-            should_trigger = True
-        else:
-            should_trigger = False
-
-        if not self._watch_ai_pending and should_trigger:
-            self._ai_log(f"triggering AI (elapsed={elapsed_ai:.0f}s, screen_active={is_active}, user_idle={user_idle:.0f}s, app={app_name})")
-            self._watch_last_ai_check = mono_now
-            self._watch_ss_change_count = 0
-            self._trigger_ai_analysis(image, app_name)
-
-        return is_active, pct
 
     # ── Prompt/dialog detection ──────────────────────────────────────────
-
-    _PROMPT_PATTERNS = (
-        # Claude Code permission dialogs (unique phrases)
-        "Allow this bash command",
-        "Allow this tool",
-        "Allow this edit",
-        "Tell Claude what to do instead",
-        "Esc to cancel",
-        "allow for this project",
-        "don't ask again",
-        # VS Code dialog buttons
-        "Accept", "Decline",
-    )
-
-    def _check_prompt_dialog(self, cg_image) -> None:
-        """OCR screenshot and check for prompt/dialog patterns (background thread)."""
-        self._watch_prompt_last_notify = _time.monotonic()
-        try:
-            text = self._ocr_screenshot(cg_image)
-            if not text:
-                return
-            text_lower = text.lower()
-            for pattern in self._PROMPT_PATTERNS:
-                if pattern.lower() in text_lower:
-                    self._ai_log(f"prompt detected: pattern='{pattern}' in {self._watch_window_name}")
-                    from datetime import datetime as _dtN
-                    ts = _dtN.now().strftime("%H:%M")
-                    self._system_notify(f"Code: Waiting for action ({ts})")
-                    # Space next notification by 120s
-                    self._watch_prompt_last_notify = _time.monotonic() + 90.0
-                    return
-        except Exception:
-            pass
-
-    def _build_task_history_context(self) -> str:
-        """Build a short summary of recent tasks for AI context."""
-        if not self.tasks:
-            return ""
-        recent = self.tasks[-5:]  # last 5 tasks
-        lines = []
-        for t in recent:
-            dur = ""
-            if t.active_end is not None and t.active_start is not None:
-                mins = int((t.active_end - t.active_start) / 60)
-                dur = f" ({mins}m)" if mins > 0 else " (<1m)"
-            elif t.active_start is not None:
-                # Current task — show elapsed
-                active = self._active_seconds()
-                mins = int((active - t.active_start) / 60)
-                dur = f" ({mins}m, ongoing)"
-            name = t.name
-            if name.startswith("\u23f3"):
-                continue
-            lines.append(f"- {name}{dur}")
-        return "\n".join(lines)
-
-    _vision_loaded = False
-    _VNRecognizeTextRequest = None
-    _VNImageRequestHandler = None
-
-    @classmethod
-    def _load_vision(cls):
-        if cls._vision_loaded:
-            return
-        try:
-            import objc
-            _globals = {}
-            objc.loadBundle('Vision', bundle_path='/System/Library/Frameworks/Vision.framework', module_globals=_globals)
-            cls._VNRecognizeTextRequest = _globals.get('VNRecognizeTextRequest')
-            cls._VNImageRequestHandler = _globals.get('VNImageRequestHandler')
-            cls._vision_loaded = True
-        except Exception:
-            cls._vision_loaded = True  # don't retry
-
-    def _ocr_screenshot(self, cg_image) -> str:
-        """Extract text from screenshot using macOS Vision OCR."""
-        try:
-            self._load_vision()
-            if not self._VNRecognizeTextRequest or not self._VNImageRequestHandler:
-                return ""
-
-            request = self._VNRecognizeTextRequest.alloc().init()
-            request.setRecognitionLevel_(1)  # 0=fast, 1=accurate
-
-            handler = self._VNImageRequestHandler.alloc().initWithCGImage_options_(cg_image, None)
-            handler.performRequests_error_([request], None)
-
-            results = request.results()
-            if not results:
-                return ""
-
-            lines = []
-            for obs in results:
-                candidates = obs.topCandidates_(1)
-                if candidates:
-                    lines.append(candidates[0].string())
-            return "\n".join(lines)
-        except Exception as e:
-            self._ai_log(f"OCR error: {e}")
-            return ""
-
-    def _trigger_ai_analysis(self, cg_image, app_name: str) -> None:
-        """OCR screenshot and send text to GPT-4o-mini."""
-        gen = self._watch_generation  # capture before async work
-        try:
-            cfg = json.loads(CONFIG_FILE.read_text())
-        except (OSError, json.JSONDecodeError):
-            cfg = {}
-        api_key = cfg.get("openai_api_key", "")
-        if not api_key:
-            self._ai_log("no api key — falling back to app name")
-            if gen == self._watch_generation:
-                self.call_from_thread(self._apply_ai_task, app_name)
-            return
-
-        # OCR the screenshot
-        screen_text = self._ocr_screenshot(cg_image)
-        if not screen_text.strip():
-            self._ai_log("OCR returned empty text")
-            return
-
-        # Truncate to ~2000 chars to keep tokens low
-        if len(screen_text) > 6000:
-            screen_text = screen_text[:6000] + "\n..."
-
-        self._watch_ai_pending = True
-        current_task = self.tasks[-1].name if self.tasks and self.tasks[-1].active_end is None else ""
-        if current_task.startswith("\u23f3"):
-            current_task = ""  # placeholder — AI must generate a new label
-        task_history = self._build_task_history_context()
-
-        # Calculate current task duration
-        task_duration_min = 0
-        if self.tasks and self.tasks[-1].active_end is None:
-            task_duration_min = int((self._now() - self.tasks[-1].wall_start).total_seconds() / 60)
-
-        prompt = (
-            "You label developer work for a time report. Read the SCREEN TEXT below and "
-            "figure out WHAT the developer is working on — the feature, component, or page.\n"
-            "\n"
-            "RULES:\n"
-            "1. Describe the HIGH-LEVEL work, not individual commands. Look at file names, "
-            "component names, imports, JSX, class names — these reveal the real task.\n"
-            "   GOOD: 'Работаю над AppSidebar'  (AppSidebar.tsx visible in editor)\n"
-            "   GOOD: 'Обновляю ActionPanel'  (ActionPanel component being edited)\n"
-            "   GOOD: 'Fixing auth middleware'  (auth.ts / middleware.ts visible)\n"
-            "   BAD:  'Running docker stop'  (that's just a command, not the work!)\n"
-            "   BAD:  'Editing file'  (which file? name it!)\n"
-            "   BAD:  'Working on code'  (too vague)\n"
-            "2. IGNORE terminal commands (docker, git, npm, pip, etc) — they are tools, "
-            "not the work itself. Focus on what FILES and COMPONENTS are being changed.\n"
-            "3. Use the component/file name from screen: 'Работаю над UserProfile', "
-            "'Fixing OfferDetailModal', 'Обновляю ShipmentTable'.\n"
-            "4. 2-5 words. Casual tone, like telling a colleague what you're doing.\n"
-            "5. Write in Russian if the project/UI has Russian text, otherwise English.\n"
-            "6. Reply SAME if the work area hasn't changed (same component/feature).\n"
-            "7. NEW label only when the developer switched to a DIFFERENT component/feature.\n"
-            "\n"
-            f"App: {app_name}\n"
-            f"Current task: {current_task} (running for {task_duration_min} min)\n"
-        )
-        if task_history:
-            prompt += f"Recent tasks:\n{task_history}\n"
-
-        # Read recent Claude Code prompts (last 5, captured by hook)
-        claude_prompts_file = STATE_DIR / "claude_prompts.json"
-        claude_entries = []
-        try:
-            if claude_prompts_file.exists():
-                entries = json.loads(claude_prompts_file.read_text())
-                if isinstance(entries, list):
-                    claude_entries = entries[-5:]
-        except (OSError, json.JSONDecodeError):
-            pass
-        # Fallback: old single-prompt file
-        if not claude_entries:
-            old_file = STATE_DIR / "claude_prompt.txt"
-            try:
-                if old_file.exists():
-                    raw = old_file.read_text().strip()
-                    try:
-                        data = json.loads(raw)
-                        claude_entries = [data]
-                    except (json.JSONDecodeError, TypeError):
-                        if raw:
-                            claude_entries = [{"prompt": raw, "cwd": ""}]
-            except OSError:
-                pass
-
-        if claude_entries:
-            prompt += "\n--- DEVELOPER'S RECENT MESSAGES TO AI ASSISTANT ---\n"
-            for entry in claude_entries:
-                p = entry.get("prompt", "")
-                c = entry.get("cwd", "")
-                if len(p) > 400:
-                    p = p[:400] + "..."
-                cwd_tag = f" [{c}]" if c else ""
-                prompt += f"• {p}{cwd_tag}\n"
-            prompt += (
-                "--- END ---\n"
-                "Use these ONLY if they relate to what's visible on screen. "
-                "If the project/directory doesn't match, IGNORE them.\n"
-            )
-
-        prompt += (
-            "\n--- SCREEN TEXT (OCR) ---\n"
-            f"{screen_text}\n"
-            "--- END ---\n"
-            "\nReply with a short label OR 'SAME'. Nothing else."
-        )
-
-        def _call_api():
-            import ssl
-            import urllib.request
-            try:
-                import certifi
-                ssl_ctx = ssl.create_default_context(cafile=certifi.where())
-            except ImportError:
-                ssl_ctx = ssl.create_default_context()
-            body = json.dumps({
-                "model": "gpt-4o",
-                "max_tokens": 30,
-                "messages": [{"role": "user", "content": prompt}],
-            })
-            req = urllib.request.Request(
-                "https://api.openai.com/v1/chat/completions",
-                data=body.encode(),
-                headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
-            )
-            try:
-                # Stale check: watch was stopped/restarted since this request began
-                if gen != self._watch_generation:
-                    self._ai_log("stale AI result — watch generation changed, discarding")
-                    return
-                with urllib.request.urlopen(req, timeout=15, context=ssl_ctx) as resp:
-                    result = json.loads(resp.read())
-                    label = result["choices"][0]["message"]["content"].strip().strip('"').strip("'")
-                    _bump_ai_usage()
-                    self._ai_log(f"ok: '{label}' (app={app_name}, current='{current_task}')")
-                    # Stale check again after API call
-                    if gen != self._watch_generation:
-                        self._ai_log("stale AI result — watch stopped, discarding")
-                        return
-                    # Normalize Cyrillic lookalikes (С→S, А→A, Е→E, etc.)
-                    _CYR_TO_LAT = str.maketrans("СсАаЕеОоРрКкМмТтНнХхВв", "SsAaEeOoPpKkMmTtNnXxBb")
-                    label_norm = label.translate(_CYR_TO_LAT).upper()
-                    if label_norm == "SAME" or "SAME" in label_norm:
-                        self._ai_log("activity unchanged — skipping")
-                    elif label and len(label) <= 50:
-                        self._watch_same_streak = 0
-                        self.call_from_thread(self._apply_ai_task, label)
-                    else:
-                        self._ai_log(f"label rejected: empty={not label}, len={len(label)}")
-            except Exception as e:
-                self._ai_log(f"api error: {e} — falling back to app name")
-                if gen == self._watch_generation:
-                    self.call_from_thread(self._apply_ai_task, app_name)
-            finally:
-                self._watch_ai_pending = False
-
-        threading.Thread(target=_call_api, daemon=True).start()
-
-    def _ai_log(self, msg: str) -> None:
-        """Append a line to ~/.timex/ai.log for debugging."""
-        try:
-            from datetime import datetime as _dt
-            ts = _dt.now().strftime("%H:%M:%S")
-            log = STATE_DIR / "ai.log"
-            with open(log, "a") as f:
-                f.write(f"[{ts}] {msg}\n")
-        except OSError:
-            pass
-
-    _JUNK_LABELS = {
-        "using terminal", "using browser", "using chrome", "using safari",
-        "using finder", "using app", "creating a task", "time tracking",
-        "using timex", "checking time", "viewing tasks", "managing tasks",
-    }
-
-    def _apply_ai_task(self, label: str) -> None:
-        """Apply AI-suggested task label (called on main thread)."""
-        if self.state != RUNNING or self._watch_mode != "screenshot":
-            return
-        # Filter junk labels
-        if label.lower().strip() in self._JUNK_LABELS:
-            self._ai_log(f"filtered junk label: '{label}'")
-            return
-        # Don't create duplicate task
-        if self.tasks and self.tasks[-1].active_end is None and self.tasks[-1].name == label:
-            return
-        # Don't interrupt idle-Thinking (10 min inactivity)
-        if self._watch_thinking:
-            return
-        self._watch_last_ai_task = label
-        # If current task is the initial "⏳ ..." placeholder, rename it in-place
-        if self.tasks and self.tasks[-1].active_end is None and self.tasks[-1].name == "\u23f3 ...":
-            self.tasks[-1].name = label
-            self._save_state()
-            self._mark_dirty()
-            return
-        # If current task is less than 5 minutes old, rename instead of creating new
-        # But never rename a task the user named manually
-        if self.tasks and self.tasks[-1].active_end is None and not self._watch_user_named:
-            task_age = (self._now() - self.tasks[-1].wall_start).total_seconds()
-            if task_age < 300:
-                self._ai_log(f"task too young ({task_age:.0f}s < 300s), renaming: '{label}'")
-                self.tasks[-1].name = label
-                self._save_state()
-                self._mark_dirty()
-                return
-        self._watch_user_named = False
-        self._add_task(label)
-
-    def _get_window_list(self) -> list[dict]:
-        try:
-            from Quartz import (
-                CGWindowListCopyWindowInfo,
-                kCGWindowListOptionOnScreenOnly,
-                kCGWindowListExcludeDesktopElements,
-                kCGNullWindowID,
-            )
-            windows = CGWindowListCopyWindowInfo(
-                kCGWindowListOptionOnScreenOnly | kCGWindowListExcludeDesktopElements,
-                kCGNullWindowID,
-            )
-            if not windows:
-                return self._get_window_list_fallback()
-
-            result = []
-            seen = set()
-            for win in windows:
-                owner = win.get("kCGWindowOwnerName", "")
-                title = win.get("kCGWindowName", "") or ""
-                wid = win.get("kCGWindowNumber", 0)
-                pid = win.get("kCGWindowOwnerPID", 0)
-                layer = win.get("kCGWindowLayer", 0)
-                if not owner or layer != 0:
-                    continue
-                if owner in ("Timex", "Window Server", "SystemUIServer", "Control Center"):
-                    continue
-                key = (pid, title or owner)
-                if key in seen:
-                    continue
-                seen.add(key)
-                display = title if title else owner
-                result.append({"id": wid, "pid": pid, "app": owner, "title": display[:60], "uptime": 0})
-            if result:
-                # Fetch uptimes and sort by most recent first
-                self._enrich_window_uptimes(result)
-                result.sort(key=lambda w: w["uptime"])
-                return result[:20]
-            # Quartz returned windows but all filtered — try fallback
-            return self._get_window_list_fallback()
-        except ImportError:
-            return self._get_window_list_fallback()
-        except Exception as e:
-            return self._get_window_list_fallback()
-
-    def _get_window_list_fallback(self) -> list[dict]:
-        try:
-            script = 'tell application "System Events"\nset output to ""\n' \
-                     'repeat with proc in (every process whose visible is true)\n' \
-                     'set pName to name of proc\nset pID to unix id of proc\n' \
-                     'repeat with w in windows of proc\n' \
-                     'set wTitle to name of w\n' \
-                     'set output to output & pID & "|||" & pName & "|||" & wTitle & linefeed\n' \
-                     'end repeat\nend repeat\nreturn output\nend tell'
-            result = subprocess.run(
-                ["osascript", "-e", script],
-                capture_output=True, text=True, timeout=5,
-            )
-            windows = []
-            for line in result.stdout.strip().split("\n"):
-                parts = line.split("|||")
-                if len(parts) == 3:
-                    pid_str, app, title = parts
-                    if app == "Timex":
-                        continue
-                    windows.append({"id": 0, "pid": int(pid_str), "app": app, "title": title[:60], "uptime": 0})
-            if windows:
-                self._enrich_window_uptimes(windows)
-                windows.sort(key=lambda w: w["uptime"])
-            return windows[:20]
-        except (subprocess.TimeoutExpired, OSError, ValueError):
-            return []
-
-    def _enrich_window_uptimes(self, windows: list[dict]) -> None:
-        """Fetch process uptimes and set 'uptime' (seconds) on each window dict."""
-        pids = list({w["pid"] for w in windows if w["pid"]})
-        if not pids:
-            return
-        try:
-            result = subprocess.run(
-                ["ps", "-p", ",".join(str(p) for p in pids), "-o", "pid=,etime="],
-                capture_output=True, text=True, timeout=3,
-            )
-            uptimes: dict[int, int] = {}
-            for line in result.stdout.strip().split("\n"):
-                line = line.strip()
-                if not line:
-                    continue
-                parts = line.split()
-                if len(parts) == 2:
-                    try:
-                        pid = int(parts[0])
-                        uptimes[pid] = self._parse_etime(parts[1])
-                    except ValueError:
-                        continue
-            for w in windows:
-                w["uptime"] = uptimes.get(w["pid"], 0)
-        except (subprocess.TimeoutExpired, OSError):
-            pass
-
-    @staticmethod
-    def _parse_etime(etime: str) -> int:
-        """Parse ps etime format (dd-HH:MM:SS or HH:MM:SS or MM:SS) to seconds."""
-        days = 0
-        if "-" in etime:
-            d, etime = etime.split("-", 1)
-            days = int(d)
-        parts = etime.split(":")
-        if len(parts) == 3:
-            return days * 86400 + int(parts[0]) * 3600 + int(parts[1]) * 60 + int(parts[2])
-        elif len(parts) == 2:
-            return days * 86400 + int(parts[0]) * 60 + int(parts[1])
-        return 0
 
     def _add_task(self, name: str) -> None:
         if self.state == IDLE:
@@ -2454,23 +1474,7 @@ class TimexApp(App):
             name=name,
             wall_start=now,
             active_start=active,
-            watched=self._watch_mode is not None,
         ))
-
-        # If user manually adds task during watch, protect it from AI rename
-        if self._watch_mode is not None and not name.startswith("\u23f3"):
-            self._watch_user_named = True
-
-        # If user manually adds task during Thinking, replace ⏳ task with user's name
-        # Watch keeps running — next detected change will create a new task as usual
-        if self._watch_thinking and not name.startswith("\u23f3"):
-            # Remove the ⏳ Thinking task (it's the one before the just-added task)
-            for j in range(len(self.tasks) - 2, -1, -1):
-                if self.tasks[j].name.startswith("\u23f3"):
-                    self.tasks.pop(j)
-                    break
-            self._watch_thinking = False
-            self._watch_last_active = _time.monotonic()
 
         self._mark_dirty()
         self._save_state()
@@ -2696,7 +1700,7 @@ class TimexApp(App):
         try:
             wb = self._build_workbook(*got)
         except ImportError:
-            self._toast("openpyxl required — pip install openpyxl", 5)
+            self._toast("Export unavailable: openpyxl is missing", 5)
             return
         path = Path.home() / "Downloads" / self._export_filename(got[0], got[1], "xlsx")
         path.parent.mkdir(exist_ok=True)
@@ -2845,6 +1849,17 @@ if(matchMedia('(prefers-reduced-motion:reduce)').matches){
                 c.fill = accent_fill
                 c.alignment = centered
 
+        def _text(ws, row: int, col: int, value: str):
+            """Write a task/project name as text.
+
+            openpyxl types a leading '=' as a formula, so a task called "=1+1" —
+            or worse, a DDE payload — would execute in the client's Excel.
+            """
+            c = ws.cell(row=row, column=col, value=value)
+            if c.data_type == "f":
+                c.data_type = "s"
+            return c
+
         wb = Workbook()
 
         # ── Report sheet: summary + breakdown + charts ──
@@ -2852,8 +1867,7 @@ if(matchMedia('(prefers-reduced-motion:reduce)').matches){
         ws.title = "Report"
         ws["A1"] = "⏱ Time Report"
         ws["A1"].font = Font(bold=True, size=14)
-        ws["A2"] = f"{self._project or 'Timex'} · {self._period_label(self._export_period)}"
-        ws["A2"].font = grey
+        _text(ws, 2, 1, f"{self._project or 'Timex'} · {self._period_label(self._export_period)}").font = grey
 
         by_day: dict[date, float] = {}
         for t, secs in zip(tasks, durations):
@@ -2891,7 +1905,7 @@ if(matchMedia('(prefers-reduced-motion:reduce)').matches){
         _head(ws, top + 1, ["Task", "Duration", "Hours", "Share"])
         for i, (name, secs, share) in enumerate(ranked):
             r = top + 2 + i
-            ws.cell(row=r, column=1, value=name)
+            _text(ws, r, 1, name)
             ws.cell(row=r, column=2, value=self._fmt_time(secs))
             c = ws.cell(row=r, column=3, value=round(secs / 3600, 2))
             c.number_format = "0.00"
@@ -2952,7 +1966,7 @@ if(matchMedia('(prefers-reduced-motion:reduce)').matches){
             ws2.cell(row=r, column=2, value=t.wall_start.strftime("%Y-%m-%d"))
             ws2.cell(row=r, column=3, value=t.wall_start.strftime("%H:%M:%S"))
             ws2.cell(row=r, column=4, value=end.strftime("%H:%M:%S"))
-            ws2.cell(row=r, column=5, value=t.name)
+            _text(ws2, r, 5, t.name)
             ws2.cell(row=r, column=6, value=self._fmt_time(secs))
             c = ws2.cell(row=r, column=7, value=round(secs / 3600, 2))
             c.number_format = "0.00"
@@ -2979,6 +1993,11 @@ if(matchMedia('(prefers-reduced-motion:reduce)').matches){
         top = self._top_tasks(tasks, durations, total, 10)
         days = self._export_by_day(tasks, durations, d_from, d_to)
         by_day = {d: s for d, s in days if s > 0}
+        # A period can hold tasks that all round to zero (started and stopped in
+        # the same second). Falling back to the day each task began keeps max()
+        # and the average off empty sequences.
+        if not by_day:
+            by_day = {t.wall_start.date(): 0.0 for t in tasks}
         busiest = max(by_day.items(), key=lambda kv: kv[1])
         avg = total / len(by_day)
         e = _esc
@@ -3122,7 +2141,7 @@ if(matchMedia('(prefers-reduced-motion:reduce)').matches){
         try:
             wb = self._build_workbook(*got)
         except ImportError:
-            self._toast("openpyxl required — pip install openpyxl", 5)
+            self._toast("Export unavailable: openpyxl is missing", 5)
             return
         buf = io.BytesIO()
         wb.save(buf)
@@ -3152,10 +2171,6 @@ if(matchMedia('(prefers-reduced-motion:reduce)').matches){
         self.total_paused = timedelta()
         self._final_active = 0.0
         self._sleep_at = 0.0
-        self._watch_thinking = False
-        self._watch_prev_task = None
-        self._watch_focus_stats = {}
-        self._stop_watch()
         self._view_mode = "timeline"
         self._update_placeholder()
         self._mark_dirty()
@@ -3163,8 +2178,6 @@ if(matchMedia('(prefers-reduced-motion:reduce)').matches){
         self._toast(f"Saved {n_tasks} tasks, {self._fmt_time(active)}")
 
     def _cmd_clear(self) -> None:
-        if self._watch_mode is not None:
-            self._stop_watch()
         self.state = IDLE
         self.tasks = []
         self._last_session_tasks = []
@@ -3172,6 +2185,7 @@ if(matchMedia('(prefers-reduced-motion:reduce)').matches){
         self.paused_at = None
         self.total_paused = timedelta()
         self._final_active = 0.0
+        self._sleep_at = 0.0  # a deadline from the old session must not pause the next one
         self._update_placeholder()
         self._mark_dirty()
         self._save_state()
@@ -3249,14 +2263,14 @@ if(matchMedia('(prefers-reduced-motion:reduce)').matches){
             ("/edit", "Edit task names in timeline"),
             ("/date", "Browse past sessions by date"),
             ("/stats", "Weekly and monthly statistics"),
-            ("/export", "Export hours to Excel (.xlsx)"),
-            ("/clear", "Clear task history"),
+            ("/export", "Report a period: visual .html page or .xlsx"),
+            ("/clear", "Discard current session without saving"),
             ("/timezone", "Change timezone for tracking"),
             ("/notification", "Set reminder interval"),
             ("/sleep", "Auto-pause after duration (e.g. 30m, 1h)"),
-            ("/track", "Monitor window activity (auto Thinking/Working)"),
             ("/reset", "Reset session (discard without saving)"),
             ("/project", "Switch project"),
+            ("/update", "Check for a new version"),
             ("/reload", "Reload app (apply code changes)"),
             ("/color", "Change accent color"),
             ("/help", "Show this help"),
@@ -3268,11 +2282,6 @@ if(matchMedia('(prefers-reduced-motion:reduce)').matches){
                 rows.append(Text.from_markup(f"[{SEPARATOR}]{'─' * 50}[/]"))
             rows.append(Text.from_markup(f"[bold {self._accent}]{cmd}[/]"))
             rows.append(Text.from_markup(f"[{DIM}]{desc}[/]"))
-
-        rows.append(Text(""))
-        rows.append(Text.from_markup(
-            f"  [{DIM}]Ctrl+X, X — add selected text as task (global hotkey)[/]"
-        ))
 
         self.query_one("#history", Static).update(Group(*rows))
 
@@ -3689,8 +2698,7 @@ if(matchMedia('(prefers-reduced-motion:reduce)').matches){
                 if i > 1:
                     rows.append(Text.from_markup(f"[{SEPARATOR}]{'─' * 50}[/]"))
                 # Read project state to show status
-                pstate, ptime, pwatch = self._read_project_status(name)
-                watch_icon = f" [{self._accent}]\u25c9[/]" if pwatch else ""
+                pstate, ptime = self._read_project_status(name)
                 if pstate == RUNNING:
                     status = f"[bold {self._accent}]\u25cf REC     {ptime}[/]"
                 elif pstate == PAUSED:
@@ -3699,7 +2707,7 @@ if(matchMedia('(prefers-reduced-motion:reduce)').matches){
                     status = f"[{DIM}]\u25cb IDLE[/]"
                 marker = f" [{self._accent}]\u2022[/]" if name == self._project else ""
                 rows.append(self._space_between(
-                    f"[bold {self._accent}]{i}.[/]{watch_icon} [{TEXT_COLOR}]{name}[/]{marker}",
+                    f"[bold {self._accent}]{i}.[/] [{TEXT_COLOR}]{name}[/]{marker}",
                     status,
                 ))
 
@@ -3710,21 +2718,19 @@ if(matchMedia('(prefers-reduced-motion:reduce)').matches){
 
         self.query_one("#history", Static).update(Group(*rows))
 
-    def _read_project_status(self, name: str) -> tuple[str, str, bool]:
-        """Read a project's state.json and return (state, formatted_time, watch_active)."""
-        # Watch only runs on current project — never show for others
-        watch_on = (name == self._project and self._watch_mode is not None)
+    def _read_project_status(self, name: str) -> tuple[str, str]:
+        """Read a project's state.json and return (state, formatted_time)."""
         sf = PROJECTS_DIR / name / "state.json"
         try:
             if not sf.exists():
-                return IDLE, "", False
+                return IDLE, ""
             data = json.loads(sf.read_text())
             state = data.get("state", IDLE)
             # Calculate active seconds from saved data
             total_paused_secs = data.get("total_paused_secs", 0.0)
             session_start_str = data.get("session_start")
             if not session_start_str:
-                return state, self._fmt_time(data.get("final_active", 0.0)), watch_on
+                return state, self._fmt_time(data.get("final_active", 0.0))
             session_start = datetime.fromisoformat(session_start_str)
             now = self._now()
             if state == RUNNING:
@@ -3736,10 +2742,10 @@ if(matchMedia('(prefers-reduced-motion:reduce)').matches){
                 else:
                     elapsed = 0.0
             else:
-                return IDLE, self._fmt_time(data.get("final_active", 0.0)), watch_on
-            return state, self._fmt_time(max(0.0, elapsed)), watch_on
+                return IDLE, self._fmt_time(data.get("final_active", 0.0))
+            return state, self._fmt_time(max(0.0, elapsed))
         except (OSError, json.JSONDecodeError, KeyError, ValueError):
-            return IDLE, "", False
+            return IDLE, ""
 
     def _select_project(self, raw: str) -> None:
         projects = []
@@ -3771,8 +2777,6 @@ if(matchMedia('(prefers-reduced-motion:reduce)').matches){
             self._leave_view()
             return
         # Stop watch before switching (watch is per-project)
-        if self._watch_mode is not None:
-            self._stop_watch()
         # Save current project state (RUNNING stays RUNNING)
         self._save_state()
 
@@ -3833,7 +2837,7 @@ if(matchMedia('(prefers-reduced-motion:reduce)').matches){
         for i, name in enumerate(projects):
             if i > 0:
                 rows.append(Text.from_markup(f"[{SEPARATOR}]{'─' * 50}[/]"))
-            pstate, ptime, _ = self._read_project_status(name)
+            pstate, ptime = self._read_project_status(name)
             if pstate == RUNNING:
                 status = f"[bold {self._accent}]● REC     {ptime}[/]"
             elif pstate == PAUSED:
@@ -4152,84 +3156,6 @@ if(matchMedia('(prefers-reduced-motion:reduce)').matches){
                     f"{bar}", f"[{DIM}]{self._fmt_time(secs)}[/]  [{TEXT_COLOR}]{pct:4.1f}%[/]",
                 ))
 
-        # ── Activity (30 days) ──
-        # Compute focus score from watched tasks
-        watched_time = 0.0
-        thinking_time = 0.0
-        total_watched_sessions = 0
-        for session in history:
-            d = session.get("date", "")
-            try:
-                session_date = datetime.strptime(d, "%Y-%m-%d").date()
-            except (ValueError, TypeError):
-                continue
-            if (today - session_date).days >= 30:
-                continue
-            session_has_watched = False
-            for t in session.get("tasks", []):
-                start = t.get("active_start", 0) or 0
-                end = t.get("active_end") or start
-                dur = max(0, end - start)
-                name = t.get("name", "")
-                is_watched = t.get("watched", False)
-                is_thinking = name.startswith("\u23f3")
-                if is_watched or is_thinking:
-                    session_has_watched = True
-                    if is_thinking:
-                        thinking_time += dur
-                    else:
-                        watched_time += dur
-            if session_has_watched:
-                total_watched_sessions += 1
-
-        if total_watched_sessions > 0:
-            total_monitored = watched_time + thinking_time
-            focus_pct = int(watched_time / total_monitored * 100) if total_monitored > 0 else 0
-            # Focus score: A+ (95+), A (85+), B (70+), C (50+), D (<50)
-            if focus_pct >= 95:
-                grade = f"[bold #98c379]A+[/]"
-            elif focus_pct >= 85:
-                grade = f"[bold #98c379]A[/]"
-            elif focus_pct >= 70:
-                grade = f"[bold {self._accent}]B[/]"
-            elif focus_pct >= 50:
-                grade = f"[bold #e5c07b]C[/]"
-            else:
-                grade = f"[bold #e06c75]D[/]"
-
-            rows.append(Text.from_markup(f"[{SEPARATOR}]{'─' * 50}[/]"))
-            rows.append(self._space_between(
-                f"[bold {TEXT_COLOR}]Focus (30 days)[/]",
-                f"{grade}  [bold {self._accent}]{focus_pct}%[/]",
-            ))
-            rows.append(Text.from_markup(
-                f"[{DIM}]{self._fmt_time(watched_time)} working  \u00b7  {self._fmt_time(thinking_time)} thinking  \u00b7  {total_watched_sessions} sessions[/]"
-            ))
-
-        # ── AI usage ──
-        ai = _read_ai_usage()
-        ai_reqs = ai.get("requests", 0)
-        if ai_reqs > 0:
-            ai_cost = ai.get("cost", 0.0)
-            # Estimate remaining hours: $0.002/req, 20 req/hour (1 every 3 min)
-            cost_per_hour = 0.002 * 20  # $0.04/hour
-            try:
-                cfg = json.loads(CONFIG_FILE.read_text()) if CONFIG_FILE.exists() else {}
-                budget = float(cfg.get("ai_budget", 3.11))
-            except (OSError, json.JSONDecodeError, ValueError):
-                budget = 3.11
-            remaining = max(0.0, budget - ai_cost)
-            hours_left = remaining / cost_per_hour if cost_per_hour > 0 else 0
-
-            rows.append(Text.from_markup(f"[{SEPARATOR}]{'─' * 50}[/]"))
-            rows.append(self._space_between(
-                f"[bold {TEXT_COLOR}]AI usage[/]",
-                f"[bold {self._accent}]{ai_reqs}[/] [{DIM}]requests[/]",
-            ))
-            rows.append(Text.from_markup(
-                f"[{DIM}]${ai_cost:.2f} spent  ·  ${remaining:.2f} left  ·  ~{int(hours_left)}h remaining[/]"
-            ))
-
         self.query_one("#history", Static).update(Group(*rows))
 
     def _cmd_back(self) -> None:
@@ -4266,7 +3192,7 @@ if(matchMedia('(prefers-reduced-motion:reduce)').matches){
         elif self._view_mode == "project_edit":
             self._project_editing = None
             self._enter_view("project", "  Enter number or type new project name • /back to return")
-        elif self._view_mode in ("dates", "help", "timezone", "notification", "edit", "color", "stats", "project", "watch", "confirm_reset", "export", "update"):
+        elif self._view_mode in ("dates", "help", "timezone", "notification", "edit", "color", "stats", "project", "confirm_reset", "export", "update"):
             self._editing_task = None
             self._leave_view()
         else:
@@ -4301,7 +3227,6 @@ if(matchMedia('(prefers-reduced-motion:reduce)').matches){
             self._viewing_tasks = tasks
             self._viewing_date = nice_date
             self._viewing_date_str = date_str
-            self._viewing_session_idx = 0
             self._render_history()
             inp = self.query_one("#task-input", HistoryInput)
             inp.placeholder = "  /edit to manage \u2022 /back to return"
@@ -4347,8 +3272,6 @@ if(matchMedia('(prefers-reduced-motion:reduce)').matches){
             "active_end": t.active_end,
             "wall_end": t.wall_end.isoformat() if t.wall_end else None,
         }
-        if t.watched:
-            d["watched"] = True
         return d
 
     @staticmethod
@@ -4359,7 +3282,6 @@ if(matchMedia('(prefers-reduced-motion:reduce)').matches){
             active_start=d["active_start"],
             active_end=d.get("active_end"),
             wall_end=datetime.fromisoformat(d["wall_end"]) if d.get("wall_end") else None,
-            watched=d.get("watched", False),
         )
 
     def _save_state(self) -> None:
@@ -4375,12 +3297,6 @@ if(matchMedia('(prefers-reduced-motion:reduce)').matches){
                 "total_paused_secs": self.total_paused.total_seconds(),
                 "final_active": self._final_active,
                 "saved_at": saved_at,
-                "watch_mode": self._watch_mode,
-                "watch_window_id": self._watch_window_id,
-                "watch_window_name": self._watch_window_name,
-                "watch_pid": self._watch_pid,
-                "watch_lost": getattr(self, '_watch_lost', False),
-                "watch_used": self._watch_used,
             }
             sf = self._state_file()
             sf.parent.mkdir(parents=True, exist_ok=True)
@@ -4406,7 +3322,6 @@ if(matchMedia('(prefers-reduced-motion:reduce)').matches){
             "session_start": self.session_start.isoformat() if self.session_start else None,
             "total_active": active,
             "tasks": [self._serialize_task(t) for t in self.tasks],
-            "watch_used": self._watch_used,
         }
 
     def _append_history(self, entry: dict) -> None:
@@ -4472,6 +3387,8 @@ if(matchMedia('(prefers-reduced-motion:reduce)').matches){
                     and hf_str == self._history_cache_path):
                 return self._history_cache
             data = json.loads(hf.read_text())
+            if not isinstance(data, list):
+                return []  # valid JSON of the wrong shape would break every caller
             TimexApp._history_cache = data
             TimexApp._history_cache_mtime = mtime
             TimexApp._history_cache_path = hf_str
@@ -4567,9 +3484,6 @@ if(matchMedia('(prefers-reduced-motion:reduce)').matches){
                     self.state = PAUSED
                 self._reset_reminder()
 
-                # Never restore watch mode on app restart — user must enable manually
-                self._watch_used = data.get("watch_used", False)
-
                 self._save_state()  # also sets self._last_saved_at
             elif saved_state == IDLE:
                 self.state = IDLE
@@ -4660,8 +3574,16 @@ if(matchMedia('(prefers-reduced-motion:reduce)').matches){
             # Fetch changelog if not cached from startup check
             self._enter_view("update", "  /back to return")
             threading.Thread(target=self._fetch_changelog_bg, daemon=True).start()
-        else:
-            self._enter_view("update", "  Enter 1 to update • /back to return")
+            return
+        info = self._update_info
+        if info.get("version", VERSION) == VERSION:
+            self._toast("Already up to date", 3)
+            return
+        # Only offer the keystroke that actually does something: a release that
+        # ships as a signed app cannot be applied by patching files in place.
+        hint = ("  /back to return" if info.get("dmg_required", True)
+                else "  Enter 1 to update • /back to return")
+        self._enter_view("update", hint)
 
     def _fetch_changelog_bg(self) -> None:
         try:
@@ -4674,7 +3596,9 @@ if(matchMedia('(prefers-reduced-motion:reduce)').matches){
             else:
                 self.call_from_thread(self._render_history)
                 inp = self.query_one("#task-input", HistoryInput)
-                self.call_from_thread(setattr, inp, "placeholder", "  Enter 1 to update • /back to return")
+                hint = ("  /back to return" if info.get("dmg_required", True)
+                        else "  Enter 1 to update • /back to return")
+                self.call_from_thread(setattr, inp, "placeholder", hint)
         except Exception as exc:
             self.call_from_thread(self._toast, f"Cannot check for updates: {exc}", 5)
             self.call_from_thread(self._leave_view)

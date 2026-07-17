@@ -65,8 +65,6 @@ def _active_project_name() -> str | None:
         pass
     return None
 
-ICON_PATH = str(Path(__file__).parent / "AppIcon.icns")
-
 GLYPH_IDLE = "○"
 GLYPH_RUNNING = "●"
 GLYPH_PAUSED = "⏸"
@@ -166,46 +164,59 @@ def _write_state(data: dict) -> None:
     tmp.replace(sf)
 
 
+def _append_history(entry: dict) -> None:
+    """Commit a finished session to history.json, same shape as the TUI writes.
+
+    Stopping from here is the end of the session, and history.json is the only
+    record it ever gets: without this the session is unreachable from /export
+    and the next Start overwrites it.
+    """
+    hf = _state_file().parent / "history.json"
+    try:
+        history = json.loads(hf.read_text()) if hf.exists() else []
+        if not isinstance(history, list):
+            history = []
+        history.append(entry)
+        hf.parent.mkdir(parents=True, exist_ok=True)
+        tmp = hf.with_suffix(".tmp")
+        tmp.write_text(json.dumps(history, indent=2))
+        tmp.replace(hf)
+    except (OSError, json.JSONDecodeError, ValueError):
+        pass
+
+
 def _active_seconds(data: dict) -> float:
-    """Calculate active seconds from state dict."""
-    state = data.get("state", IDLE)
-    session_start_str = data.get("session_start")
-    if not session_start_str or state == IDLE:
-        return data.get("final_active", 0.0)
+    """Calculate active seconds from state dict.
 
-    session_start = datetime.fromisoformat(session_start_str)
-    total_paused = timedelta(seconds=data.get("total_paused_secs", 0.0))
+    Every field here comes off disk and is also written by the TUI, so a torn or
+    hand-edited state.json must not take the widget down: this runs once a second
+    and an exception would kill the timer for good.
+    """
+    try:
+        state = data.get("state", IDLE)
+        session_start_str = data.get("session_start")
+        if not session_start_str or state == IDLE:
+            return float(data.get("final_active", 0.0) or 0.0)
 
-    if state == RUNNING:
-        elapsed = (_now() - session_start) - total_paused
-    elif state == PAUSED:
-        paused_at_str = data.get("paused_at")
-        if paused_at_str:
-            paused_at = datetime.fromisoformat(paused_at_str)
-            elapsed = (paused_at - session_start) - total_paused
+        session_start = datetime.fromisoformat(session_start_str)
+        total_paused = timedelta(seconds=float(data.get("total_paused_secs", 0.0) or 0.0))
+
+        if state == PAUSED:
+            paused_at_str = data.get("paused_at")
+            # A paused session with no paused_at would otherwise keep ticking up,
+            # disagreeing with the TUI. Freeze it at the last save instead.
+            stop_at = data.get("saved_at") if not paused_at_str else paused_at_str
+            end = datetime.fromisoformat(stop_at) if stop_at else _now()
+        elif state == RUNNING:
+            end = _now()
         else:
-            elapsed = (_now() - session_start) - total_paused
-    else:
-        elapsed = timedelta()
+            return 0.0
 
-    return max(0.0, elapsed.total_seconds())
+        return max(0.0, ((end - session_start) - total_paused).total_seconds())
+    except (ValueError, TypeError, OverflowError):
+        return float(data.get("final_active", 0.0) or 0.0) if isinstance(
+            data.get("final_active"), (int, float)) else 0.0
 
-
-def _all_sessions_active() -> float:
-    """Sum of active (session) seconds across all projects."""
-    total = 0.0
-    if PROJECTS_DIR.exists():
-        for d in PROJECTS_DIR.iterdir():
-            if d.is_dir():
-                sf = d / "state.json"
-                if not sf.exists():
-                    continue
-                try:
-                    data = json.loads(sf.read_text())
-                    total += _active_seconds(data)
-                except (OSError, json.JSONDecodeError):
-                    pass
-    return total
 
 
 # ── Menu Bar App ─────────────────────────────────────────────────────────────
@@ -435,12 +446,9 @@ class TimexMenuBar(rumps.App):
     def _do_stop(self, data: dict) -> None:
         now = _now()
 
-        # Account for pause if currently paused
-        if data.get("state") == PAUSED and data.get("paused_at"):
-            paused_at = datetime.fromisoformat(data["paused_at"])
-            pause_dur = (now - paused_at).total_seconds()
-            data["total_paused_secs"] = data.get("total_paused_secs", 0.0) + pause_dur
-
+        # Read the clock before touching total_paused: when paused, _active_seconds
+        # already stops at paused_at, so folding the current pause in here would
+        # subtract it a second time and under-report the session.
         active = _active_seconds(data)
 
         # Finalize last task
@@ -449,11 +457,22 @@ class TimexMenuBar(rumps.App):
             tasks[-1]["active_end"] = active
             tasks[-1]["wall_end"] = now.isoformat()
 
+        # Stop ends the session, so commit it now. Clearing tasks keeps a later
+        # /new from filing it twice; the timeline still shows it from
+        # last_session_tasks.
+        if tasks:
+            _append_history({
+                "date": str(tasks[0].get("wall_start", ""))[:10],
+                "session_start": data.get("session_start"),
+                "total_active": active,
+                "tasks": list(tasks),
+            })
+
         data.update({
             "state": IDLE,
             "paused_at": None,
             "final_active": active,
-            "tasks": tasks,
+            "tasks": [],
             "last_session_tasks": list(tasks),
             "saved_at": now.isoformat(),
         })

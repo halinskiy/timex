@@ -1,13 +1,14 @@
 {
-  "version": "1.1.0",
+  "version": "1.1.1",
   "dmg_required": true,
   "changes": [
-    "Google Sheets sync removed — /export now reports for a day, week, month or custom range",
-    "Visual report: a self-contained .html page with the workbook embedded, safe to send to a client",
-    "Excel export reworked: summary, longest tasks, hours per day, one row per task",
-    "Menu bar timer no longer jitters — fixed-width digits",
-    "Locked UI mode removed",
-    "Automatic backups of project history in ~/.timex/backups/",
-    "App is signed with Developer ID and notarized; the menu bar widget no longer needs a system Python"
+    "Stopping from the menu bar no longer loses the session — it is committed to history",
+    "Stopping while paused no longer subtracts the pause twice",
+    "Visual report no longer crashes when every task in the period is zero-length",
+    "Task names starting with '=' are written as text, not as Excel formulas",
+    "A /sleep deadline no longer outlives its session",
+    "Corrupt state, history or config files no longer take the app or the widget down",
+    "28 MB smaller: Pillow, tkinter/Tcl/Tk and the CPython test suite were dead weight",
+    "/help now matches what the app actually does"
   ]
 }
