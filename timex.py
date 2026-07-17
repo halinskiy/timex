@@ -77,7 +77,7 @@ AUTOSAVE_INTERVAL = 30  # seconds between autosaves during tick
 CONFIG_FILE = STATE_DIR / "config.json"
 CRASH_LOG = STATE_DIR / "crash.log"
 
-VERSION = "1.3.0"
+VERSION = "1.3.1"
 # Patching these in place rewrites files inside the bundle, which breaks the
 # notarised signature. Updates therefore ship as a fresh signed app: changelog
 # entries default to dmg_required, and self-patching is opt-in per release.
@@ -1833,30 +1833,26 @@ if(matchMedia('(prefers-reduced-motion:reduce)').matches){
 
         # ── Detail sheet: one row per task ──
         ws2 = wb.create_sheet("Detail")
-        _head(ws2, 1, ["#", "Date", "Start", "End", "Task", "Duration", "Hours"])
+        _head(ws2, 1, ["#", "Date", "Task", "Duration", "Hours"])
         for i, (t, secs) in enumerate(zip(tasks, durations), 1):
             r = i + 1
-            end = t.wall_end or self._now()
             ws2.cell(row=r, column=1, value=i).alignment = centered
             ws2.cell(row=r, column=2, value=t.wall_start.strftime("%Y-%m-%d"))
-            ws2.cell(row=r, column=3, value=t.wall_start.strftime("%H:%M:%S"))
-            ws2.cell(row=r, column=4, value=end.strftime("%H:%M:%S"))
-            _text(ws2, r, 5, t.name)
-            ws2.cell(row=r, column=6, value=self._fmt_time(secs))
-            c = ws2.cell(row=r, column=7, value=round(secs / 3600, 2))
+            _text(ws2, r, 3, t.name)
+            ws2.cell(row=r, column=4, value=self._fmt_time(secs))
+            c = ws2.cell(row=r, column=5, value=round(secs / 3600, 2))
             c.number_format = "0.00"
-            for col in range(1, 8):
+            for col in range(1, 6):
                 ws2.cell(row=r, column=col).border = thin
         total_row = len(tasks) + 2
-        ws2.cell(row=total_row, column=5, value="TOTAL").font = bold
-        ws2.cell(row=total_row, column=6, value=self._fmt_time(total)).font = bold
-        c = ws2.cell(row=total_row, column=7, value=round(total / 3600, 2))
+        ws2.cell(row=total_row, column=3, value="TOTAL").font = bold
+        ws2.cell(row=total_row, column=4, value=self._fmt_time(total)).font = bold
+        c = ws2.cell(row=total_row, column=5, value=round(total / 3600, 2))
         c.font = bold
         c.number_format = "0.00"
-        ws2.auto_filter.ref = f"A1:G{len(tasks) + 1}"
+        ws2.auto_filter.ref = f"A1:E{len(tasks) + 1}"
         ws2.freeze_panes = "A2"
-        for col, width in {"A": 6, "B": 12, "C": 11, "D": 11,
-                           "E": 46, "F": 12, "G": 9}.items():
+        for col, width in {"A": 6, "B": 12, "C": 52, "D": 12, "E": 9}.items():
             ws2.column_dimensions[col].width = width
 
         return wb
@@ -1903,18 +1899,12 @@ if(matchMedia('(prefers-reduced-motion:reduce)').matches){
 
         hero = f'<span id="hero" data-secs="{int(total)}">{self._fmt_time(total)}</span>'
         longest = max(durations)
-        first = min(t.wall_start for t in tasks)
-        last = max((t.wall_end or self._now()) for t in tasks)
         if d_from == d_to:
             # On a single day "avg/day" and "busiest day" only repeat the total.
-            # A session can also run past midnight, and a bare "03:20" would then
-            # read as a short day, so name the weekday it landed on.
-            over = (last.date() - first.date()).days
+            # No wall-clock times either: hours added by hand make a start time
+            # disagree with the duration beside it, which only invites questions.
             tiles = [
                 ("Tracked", hero, f"{total / 3600:.2f} h", True),
-                ("First entry", first.strftime("%H:%M"), first.strftime("%A"), False),
-                ("Last entry", last.strftime("%H:%M"),
-                 last.strftime("%A") + (f" (+{over}d)" if over else ""), False),
                 ("Tasks", str(len(tasks)), "logged", False),
                 ("Longest task", self._fmt_time(longest), f"{longest / 3600:.2f} h", False),
                 ("Average task", self._fmt_time(total / len(tasks)),
@@ -1964,8 +1954,6 @@ if(matchMedia('(prefers-reduced-motion:reduce)').matches){
 
         rows = "".join(
             f"<tr><td class=\"n num\">{i}</td><td class=\"num\">{t.wall_start.strftime('%Y-%m-%d')}</td>"
-            f"<td class=\"num\">{t.wall_start.strftime('%H:%M')}</td>"
-            f"<td class=\"num\">{(t.wall_end or self._now()).strftime('%H:%M')}</td>"
             f"<td class=\"tk\">{e(t.name)}</td><td class=\"n num\">{self._fmt_time(s)}</td>"
             f"<td class=\"n num\">{s / 3600:.2f}</td></tr>"
             for i, (t, s) in enumerate(zip(tasks, durations), 1)
@@ -1992,7 +1980,7 @@ if(matchMedia('(prefers-reduced-motion:reduce)').matches){
             f'<div class="bars">{bars}</div></div><div class="xaxis">{axis}</div>'
             f'<div class="rule"></div><h2>Detail</h2>'
             f'<div class="note">Every tracked task, in order.</div><table><thead><tr>'
-            f'<th class="n">#</th><th>Date</th><th>Start</th><th>End</th>'
+            f'<th class="n">#</th><th>Date</th>'
             f'<th class="tk">Task</th><th class="n">Duration</th><th class="n">Hours</th></tr></thead>'
             f"<tbody>{rows}</tbody></table>"
             f"<footer>Generated by Timex · {self._now().strftime('%Y-%m-%d %H:%M')}</footer>"
