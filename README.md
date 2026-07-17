@@ -89,7 +89,6 @@ or a project). The last 30 snapshots are kept; restoring is a plain folder copy 
 | `/date` | Browse history |
 | `/stats` | View statistics |
 | `/color` | Change accent color |
-| `/timezone` | Set timezone |
 | `/notification` | Configure reminders |
 | `/update` | Check for a new version |
 | `/help` | Show help |

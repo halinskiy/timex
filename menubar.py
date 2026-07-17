@@ -25,7 +25,6 @@ import threading
 import time as _time
 from datetime import datetime, timedelta
 from pathlib import Path
-from zoneinfo import ZoneInfo
 
 import AppKit
 import rumps
@@ -40,7 +39,6 @@ PAUSED = "paused"
 STATE_DIR = Path.home() / ".timex"
 PROJECTS_DIR = STATE_DIR / "projects"
 ACTIVE_PROJECT_FILE = STATE_DIR / "active_project"
-CONFIG_FILE = STATE_DIR / "config.json"
 
 
 def _state_file() -> Path:
@@ -129,15 +127,7 @@ def _notify(title: str, subtitle: str, message: str) -> None:
 
 
 def _now() -> datetime:
-    """Return current time in configured timezone (naive)."""
-    try:
-        if CONFIG_FILE.exists():
-            cfg = json.loads(CONFIG_FILE.read_text())
-            tz_name = cfg.get("timezone")
-            if tz_name:
-                return datetime.now(ZoneInfo(tz_name)).replace(tzinfo=None)
-    except (OSError, json.JSONDecodeError, KeyError):
-        pass
+    """Local wall clock — must match the TUI's _now(), it shares state.json."""
     return datetime.now()
 
 

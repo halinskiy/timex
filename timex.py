@@ -30,7 +30,6 @@ import webbrowser
 from datetime import date, datetime, timedelta
 from html import escape as _esc
 from pathlib import Path
-from zoneinfo import ZoneInfo
 import re
 import shutil
 import ssl
@@ -91,7 +90,7 @@ AUTOSAVE_INTERVAL = 30  # seconds between autosaves during tick
 CONFIG_FILE = STATE_DIR / "config.json"
 CRASH_LOG = STATE_DIR / "crash.log"
 
-VERSION = "1.1.1"
+VERSION = "1.1.2"
 # Patching these in place rewrites files inside the bundle, which breaks the
 # notarised signature. Updates therefore ship as a fresh signed app: changelog
 # entries default to dmg_required, and self-patching is opt-in per release.
@@ -105,21 +104,6 @@ try:
 except Exception:
     _SSL_CTX.check_hostname = False
     _SSL_CTX.verify_mode = ssl.CERT_NONE
-
-POPULAR_TIMEZONES = [
-    "Europe/London",
-    "Europe/Berlin",
-    "Europe/Paris",
-    "Europe/Moscow",
-    "Asia/Tbilisi",
-    "Asia/Dubai",
-    "America/New_York",
-    "America/Chicago",
-    "America/Los_Angeles",
-    "Asia/Tokyo",
-    "Asia/Singapore",
-    "Australia/Sydney",
-]
 
 
 # ── Cyrillic → Latin map (ЙЦУКЕН → QWERTY keyboard layout) ──────────────────
@@ -171,9 +155,9 @@ class TaskEntry:
 # ── Command suggestions ──────────────────────────────────────────────────────
 
 STATE_COMMANDS: dict[str, list[str]] = {
-    IDLE:    ["/start", "/new", "/date", "/stats", "/export", "/edit", "/clear", "/help", "/timezone", "/notification", "/color", "/project", "/update", "/reload"],
-    RUNNING: ["/pause", "/add", "/remove", "/sleep", "/reset", "/new", "/clear", "/date", "/stats", "/export", "/edit", "/help", "/timezone", "/notification", "/color", "/project", "/update", "/reload"],
-    PAUSED:  ["/resume", "/add", "/remove", "/reset", "/new", "/clear", "/date", "/stats", "/export", "/edit", "/help", "/timezone", "/notification", "/color", "/project", "/update", "/reload"],
+    IDLE:    ["/start", "/new", "/date", "/stats", "/export", "/edit", "/clear", "/help", "/notification", "/color", "/project", "/update", "/reload"],
+    RUNNING: ["/pause", "/add", "/remove", "/sleep", "/reset", "/new", "/clear", "/date", "/stats", "/export", "/edit", "/help", "/notification", "/color", "/project", "/update", "/reload"],
+    PAUSED:  ["/resume", "/add", "/remove", "/reset", "/new", "/clear", "/date", "/stats", "/export", "/edit", "/help", "/notification", "/color", "/project", "/update", "/reload"],
 }
 
 
@@ -427,7 +411,7 @@ class TimexApp(App):
     ]
 
     def _enter_view(self, mode: str, placeholder: str) -> None:
-        """Switch to a sub-view (help, timezone, notification, color, dates, edit)."""
+        """Switch to a sub-view (help, notification, color, dates, edit)."""
         self._view_mode = mode
         self._render_timer()
         self._render_history()
@@ -487,12 +471,11 @@ class TimexApp(App):
         self._last_autosave: float = 0.0
         self._dirty_history: bool = True
         self._last_saved_at: str = ""  # track saved_at to detect external changes
-        self._view_mode: str = "timeline"  # "timeline" | "dates" | "history_detail" | "help" | "timezone" | "notification" | "color"
+        self._view_mode: str = "timeline"  # "timeline" | "dates" | "history_detail" | "help" | "notification" | "color"
         self._viewing_tasks: list[TaskEntry] = []
         self._viewing_date: str = ""
         self._viewing_date_str: str = ""  # ISO date for resume
         self._dates_list: list[str] = []  # ordered date strings for selection
-        self._tz: ZoneInfo | None = None  # loaded from config
         self._reminder_interval: int = DEFAULT_REMINDER_INTERVAL
         self._edit_index: int = 0  # selected task index in edit mode
         self._editing_task: int | None = None  # index of task being renamed
@@ -567,20 +550,15 @@ class TimexApp(App):
         self.query_one("#task-input", HistoryInput).focus()
 
 
-    # ── Timezone ──────────────────────────────────────────────────────────
+    # ── Time helpers ─────────────────────────────────────────────────────
 
     def _now(self) -> datetime:
-        if self._tz:
-            return datetime.now(self._tz).replace(tzinfo=None)
         return datetime.now()
 
     def _load_config(self) -> None:
         try:
             if CONFIG_FILE.exists():
                 cfg = json.loads(CONFIG_FILE.read_text())
-                tz_name = cfg.get("timezone")
-                if tz_name:
-                    self._tz = ZoneInfo(tz_name)
                 ri = cfg.get("reminder_interval")
                 if ri is not None:
                     self._reminder_interval = int(ri)
@@ -611,9 +589,6 @@ class TimexApp(App):
             tmp.replace(CONFIG_FILE)
         except OSError:
             pass
-
-    def _save_timezone(self, tz_name: str | None) -> None:
-        self._save_config("timezone", tz_name)
 
     # ── APM Tracking (HIDIdleTime) ──────────────────────────────────────
 
@@ -788,10 +763,6 @@ class TimexApp(App):
         if self._view_mode == "help":
             scroll.border_title = "Help"
             self._render_help()
-            return
-        if self._view_mode == "timezone":
-            scroll.border_title = "Timezone"
-            self._render_timezone()
             return
         if self._view_mode == "notification":
             scroll.border_title = "Notifications"
@@ -1131,7 +1102,7 @@ class TimexApp(App):
             return True
         if self._view_mode == "project_edit" and self._project_editing is not None:
             return True
-        if self._view_mode in ("timezone", "notification"):
+        if self._view_mode == "notification":
             return True
         return False
 
@@ -1230,8 +1201,6 @@ class TimexApp(App):
             self._cmd_date()
         elif cmd == "/help":
             self._cmd_help()
-        elif cmd == "/timezone":
-            self._cmd_timezone()
         elif cmd == "/notification":
             self._cmd_notification()
         elif cmd == "/color":
@@ -1258,8 +1227,6 @@ class TimexApp(App):
             self._select_date_sessions(raw)
         elif self._view_mode == "edit_sessions":
             self._select_edit_sessions(raw)
-        elif self._view_mode == "timezone":
-            self._select_timezone(raw)
         elif self._view_mode == "notification":
             self._select_notification(raw)
         elif self._view_mode == "color":
@@ -2265,7 +2232,6 @@ if(matchMedia('(prefers-reduced-motion:reduce)').matches){
             ("/stats", "Weekly and monthly statistics"),
             ("/export", "Report a period: visual .html page or .xlsx"),
             ("/clear", "Discard current session without saving"),
-            ("/timezone", "Change timezone for tracking"),
             ("/notification", "Set reminder interval"),
             ("/sleep", "Auto-pause after duration (e.g. 30m, 1h)"),
             ("/reset", "Reset session (discard without saving)"),
@@ -2285,79 +2251,6 @@ if(matchMedia('(prefers-reduced-motion:reduce)').matches){
 
         self.query_one("#history", Static).update(Group(*rows))
 
-    def _cmd_timezone(self) -> None:
-        self._enter_view("timezone", "  Enter number or timezone name \u2022 /back to return")
-
-    def _render_timezone(self) -> None:
-
-        rows = []
-
-        # Current setting
-        if self._tz:
-            cur_time = datetime.now(self._tz).strftime("%H:%M %Z")
-            cur_name = str(self._tz)
-        else:
-            cur_time = datetime.now().strftime("%H:%M")
-            cur_name = "System local time"
-        rows.append(Text.from_markup(
-            f"[bold {TEXT_COLOR}]Current: {cur_name}[/]  [{DIM}]({cur_time})[/]"
-        ))
-        rows.append(Text.from_markup(f"[{SEPARATOR}]{'─' * 50}[/]"))
-
-        # Numbered list
-        rows.append(self._space_between(
-            f"[bold {self._accent}]1.[/] [{TEXT_COLOR}]System local time[/]",
-            f"[{DIM}]{datetime.now().strftime('%H:%M')}[/]",
-        ))
-
-        for i, tz_name in enumerate(POPULAR_TIMEZONES, start=2):
-            try:
-                tz = ZoneInfo(tz_name)
-                t = datetime.now(tz).strftime("%H:%M")
-                rows.append(Text.from_markup(f"[{SEPARATOR}]{'─' * 50}[/]"))
-                rows.append(self._space_between(
-                    f"[bold {self._accent}]{i}.[/] [{TEXT_COLOR}]{tz_name}[/]",
-                    f"[{DIM}]{t}[/]",
-                ))
-            except Exception:
-                continue
-
-        rows.append(Text(""))
-        rows.append(Text.from_markup(
-            f"  [{DIM}]Or type a timezone name (e.g. Asia/Kolkata)[/]"
-        ))
-
-        self.query_one("#history", Static).update(Group(*rows))
-
-    def _select_timezone(self, raw: str) -> None:
-        if raw.isdigit():
-            num = int(raw)
-            if num == 1:
-                # System local time
-                self._tz = None
-                self._save_timezone(None)
-                self._leave_view("Timezone: system local time")
-                return
-            idx = num - 2
-            if 0 <= idx < len(POPULAR_TIMEZONES):
-                tz_name = POPULAR_TIMEZONES[idx]
-                try:
-                    self._tz = ZoneInfo(tz_name)
-                    self._save_timezone(tz_name)
-                    self._leave_view(f"Timezone: {tz_name}")
-                    return
-                except Exception:
-                    pass
-            self._toast(f"Enter 1\u2013{len(POPULAR_TIMEZONES) + 1}")
-            return
-
-        # Try as timezone name
-        try:
-            self._tz = ZoneInfo(raw)
-            self._save_timezone(raw)
-            self._leave_view(f"Timezone: {raw}")
-        except Exception:
-            self._toast(f"Unknown timezone: {raw}")
 
     def _cmd_notification(self) -> None:
         self._enter_view("notification", "  Enter number or custom interval \u2022 /back to return")
@@ -3192,7 +3085,7 @@ if(matchMedia('(prefers-reduced-motion:reduce)').matches){
         elif self._view_mode == "project_edit":
             self._project_editing = None
             self._enter_view("project", "  Enter number or type new project name • /back to return")
-        elif self._view_mode in ("dates", "help", "timezone", "notification", "edit", "color", "stats", "project", "confirm_reset", "export", "update"):
+        elif self._view_mode in ("dates", "help", "notification", "edit", "color", "stats", "project", "confirm_reset", "export", "update"):
             self._editing_task = None
             self._leave_view()
         else:

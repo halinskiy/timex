@@ -1,14 +1,8 @@
 {
-  "version": "1.1.1",
+  "version": "1.1.2",
   "dmg_required": true,
   "changes": [
-    "Stopping from the menu bar no longer loses the session — it is committed to history",
-    "Stopping while paused no longer subtracts the pause twice",
-    "Visual report no longer crashes when every task in the period is zero-length",
-    "Task names starting with '=' are written as text, not as Excel formulas",
-    "A /sleep deadline no longer outlives its session",
-    "Corrupt state, history or config files no longer take the app or the widget down",
-    "28 MB smaller: Pillow, tkinter/Tcl/Tk and the CPython test suite were dead weight",
-    "/help now matches what the app actually does"
+    "/timezone removed — timestamps are naive, so changing zone mid-session shifted the clock. Both the app and the widget now use the local wall clock.",
+    "The widget no longer re-reads config.json every second"
   ]
 }
