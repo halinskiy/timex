@@ -76,7 +76,7 @@ AUTOSAVE_INTERVAL = 30  # seconds between autosaves during tick
 CONFIG_FILE = STATE_DIR / "config.json"
 CRASH_LOG = STATE_DIR / "crash.log"
 
-VERSION = "1.3.3"
+VERSION = "1.4.0"
 # Patching these in place rewrites files inside the bundle, which breaks the
 # notarised signature. Updates therefore ship as a fresh signed app: changelog
 # entries default to dmg_required, and self-patching is opt-in per release.
@@ -483,6 +483,21 @@ class TimexApp(App):
             return PROJECTS_DIR / self._project
         return STATE_DIR
 
+    @staticmethod
+    def _write_active_project(name: str) -> None:
+        """Atomically point active_project at a project.
+
+        A plain write_text truncates first, so the widget reading mid-write could
+        see an empty name and fall back to the wrong (legacy) state file.
+        """
+        try:
+            STATE_DIR.mkdir(parents=True, exist_ok=True)
+            tmp = ACTIVE_PROJECT_FILE.with_suffix(".tmp")
+            tmp.write_text(name)
+            tmp.replace(ACTIVE_PROJECT_FILE)
+        except OSError:
+            pass
+
     def _state_file(self) -> Path:
         return self._project_dir() / "state.json"
 
@@ -601,6 +616,12 @@ class TimexApp(App):
             sf = self._state_file()
             if not sf.exists():
                 return
+            # Runs on every 0.5s tick; a stat() is far cheaper than a parse, so
+            # only read when the file actually changed since we last looked.
+            mtime = sf.stat().st_mtime
+            if mtime == getattr(self, "_ext_seen_mtime", None):
+                return
+            self._ext_seen_mtime = mtime
             data = json.loads(sf.read_text())
         except (OSError, json.JSONDecodeError):
             return
@@ -653,7 +674,14 @@ class TimexApp(App):
 
     def _render_all(self) -> None:
         self._render_timer()
-        if self._dirty_history or (self.state == RUNNING and self.tasks and self.tasks[-1].active_end is None):
+        # A running timer needs the timeline refreshed each tick, but a sub-view
+        # (stats, help, project…) is static — re-rendering it every 0.5s just
+        # recomputes the whole history for nothing. Explicit changes still flow
+        # through _dirty_history.
+        live = (self._view_mode == "timeline"
+                and self.state == RUNNING and self.tasks
+                and self.tasks[-1].active_end is None)
+        if self._dirty_history or live:
             self._render_history()
             self._dirty_history = False
         self._render_footer()
@@ -1404,15 +1432,21 @@ class TimexApp(App):
         History only gains a session once it is closed with /new, so a stopped
         session still lives in memory and has to be picked up from there.
         """
+        now = self._now()
+        def overlaps(t: TaskEntry) -> bool:
+            # A task belongs to the period if its span touches it — a session that
+            # began at 23:30 and ran past midnight must still show in "today".
+            end = (t.wall_end or now).date()
+            return t.wall_start.date() <= date_to and end >= date_from
         out: list[TaskEntry] = []
         for session in self._load_history():
             for td in session.get("tasks", []):
                 t = self._deserialize_task(td)
-                if date_from <= t.wall_start.date() <= date_to:
+                if overlaps(t):
                     out.append(t)
         live = self.tasks if self.tasks else self._last_session_tasks
         for t in live:
-            if date_from <= t.wall_start.date() <= date_to:
+            if overlaps(t):
                 out.append(t)
         out.sort(key=lambda t: t.wall_start)
         return out
@@ -2426,11 +2460,13 @@ if(matchMedia('(prefers-reduced-motion:reduce)').matches){
         is_current = (task.active_end is None)
         active = self._active_seconds()
 
-        # Calculate task duration
+        # Calculate task duration, clamped to what is actually on the clock so a
+        # stale active_start can't subtract time the current session never had.
         if is_current:
             duration = active - task.active_start
         else:
             duration = (task.active_end or task.active_start) - task.active_start
+        duration = max(0.0, min(duration, active))
 
         if duration <= 0:
             tasks.pop(idx)
@@ -2582,7 +2618,7 @@ if(matchMedia('(prefers-reduced-motion:reduce)').matches){
         self._project = name
         try:
             STATE_DIR.mkdir(parents=True, exist_ok=True)
-            ACTIVE_PROJECT_FILE.write_text(name)
+            self._write_active_project(name)
         except OSError:
             pass
 
@@ -2726,7 +2762,7 @@ if(matchMedia('(prefers-reduced-motion:reduce)').matches){
             if self._project == old_name:
                 self._project = new_name
                 try:
-                    ACTIVE_PROJECT_FILE.write_text(new_name)
+                    self._write_active_project(new_name)
                 except OSError:
                     pass
             self._project_editing = None
@@ -2783,7 +2819,7 @@ if(matchMedia('(prefers-reduced-motion:reduce)').matches){
                     if projects:
                         self._project = projects[0]
                         try:
-                            ACTIVE_PROJECT_FILE.write_text(projects[0])
+                            self._write_active_project(projects[0])
                         except OSError:
                             pass
                         self._load_state()

@@ -3,6 +3,7 @@
 
 import atexit
 import os
+import secrets
 import signal
 import socket
 import subprocess
@@ -12,6 +13,31 @@ import time
 PYTHON = sys.executable
 RESOURCES = os.path.dirname(os.path.abspath(__file__))
 SERVE_PY = os.path.join(RESOURCES, "serve.py")
+TOKEN_FILE = os.path.join(os.path.expanduser("~"), ".timex", ".serve_token")
+
+
+def _serve_token(generate: bool) -> str:
+    """Shared secret between the server and our own webview.
+
+    Kept in a file only this user can read; a web page hitting localhost can't
+    read it, so it can't forge the connection. Reused (not regenerated) when we
+    attach to an already-running instance's server.
+    """
+    if generate:
+        token = secrets.token_urlsafe(18)
+        try:
+            os.makedirs(os.path.dirname(TOKEN_FILE), exist_ok=True)
+            with open(TOKEN_FILE, "w") as fh:
+                fh.write(token)
+            os.chmod(TOKEN_FILE, 0o600)
+        except OSError:
+            pass
+        return token
+    try:
+        with open(TOKEN_FILE) as fh:
+            return fh.read().strip()
+    except OSError:
+        return ""
 # The widget runs from the bundle's own second executable (see SCRIPT_MAP in
 # __boot__.py). It has to be an app-bundled binary: a bare python cannot own a
 # menu bar item. Shelling out to a system python worked only on this Mac.
@@ -48,54 +74,65 @@ def _menubar_running() -> bool:
 
 
 def main() -> None:
-    # Start menu bar widget only if not already running
+    server_proc = None
     menubar_proc = None
-    if not _menubar_running():
-        try:
-            menubar_proc = subprocess.Popen(
-                [MENUBAR_EXE],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-            )
-        except OSError:
-            menubar_proc = None  # no widget is bad; no app at all is worse
 
-    # Send stderr to a file, not a pipe: nothing reads the pipe once startup
-    # succeeds, so ~64 KB of server chatter would fill the buffer and block
-    # serve.py mid-write, hanging the whole app.
-    serve_log_path = os.path.join(os.path.expanduser("~"), ".timex", "serve.log")
-    try:
-        os.makedirs(os.path.dirname(serve_log_path), exist_ok=True)
-        serve_log = open(serve_log_path, "w")
-    except OSError:
-        serve_log = subprocess.DEVNULL
-    server_proc = subprocess.Popen(
-        [PYTHON, SERVE_PY, HOST, str(PORT)],
-        stdout=subprocess.DEVNULL,
-        stderr=serve_log,
-    )
+    # If the port is already serving, another Timex is running. Starting a second
+    # server would just crash on the bound port while we connect to the first one
+    # anyway. Reuse it: open a window and start nothing of our own (so cleanup,
+    # which only touches processes we started, can't hurt the other instance).
+    reuse_existing = _port_open(HOST, PORT)
+    # Reuse the running server's token; generate a fresh one when we start our own.
+    token = _serve_token(generate=not reuse_existing)
 
-    for _ in range(40):
-        if _port_open(HOST, PORT):
-            break
-        # Check if process crashed
-        if server_proc.poll() is not None:
+    if not reuse_existing:
+        # Start menu bar widget only if not already running
+        if not _menubar_running():
             try:
-                with open(serve_log_path) as fh:
-                    err = fh.read()
+                menubar_proc = subprocess.Popen(
+                    [MENUBAR_EXE],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
             except OSError:
-                err = ""
-            print(f"Timex: server crashed\n{err}", file=sys.stderr)
+                menubar_proc = None  # no widget is bad; no app at all is worse
+
+        # Send stderr to a file, not a pipe: nothing reads the pipe once startup
+        # succeeds, so ~64 KB of server chatter would fill the buffer and block
+        # serve.py mid-write, hanging the whole app.
+        serve_log_path = os.path.join(os.path.expanduser("~"), ".timex", "serve.log")
+        try:
+            os.makedirs(os.path.dirname(serve_log_path), exist_ok=True)
+            serve_log = open(serve_log_path, "w")
+        except OSError:
+            serve_log = subprocess.DEVNULL
+        server_proc = subprocess.Popen(
+            [PYTHON, SERVE_PY, HOST, str(PORT), token],
+            stdout=subprocess.DEVNULL,
+            stderr=serve_log,
+        )
+
+        for _ in range(40):
+            if _port_open(HOST, PORT):
+                break
+            # Check if process crashed
+            if server_proc.poll() is not None:
+                try:
+                    with open(serve_log_path) as fh:
+                        err = fh.read()
+                except OSError:
+                    err = ""
+                print(f"Timex: server crashed\n{err}", file=sys.stderr)
+                if menubar_proc:
+                    menubar_proc.kill()
+                sys.exit(1)
+            time.sleep(0.5)
+        else:
+            server_proc.kill()
             if menubar_proc:
                 menubar_proc.kill()
+            print("Timex: server failed to start", file=sys.stderr)
             sys.exit(1)
-        time.sleep(0.5)
-    else:
-        server_proc.kill()
-        if menubar_proc:
-            menubar_proc.kill()
-        print("Timex: server failed to start", file=sys.stderr)
-        sys.exit(1)
 
     # Cleanup function — kill all child processes
     _cleaned = False
@@ -112,19 +149,15 @@ def main() -> None:
                 server_proc.wait(timeout=2)
             except OSError:
                 pass
-        # Kill menubar with SIGKILL (rumps ignores SIGTERM)
+        # Kill menubar with SIGKILL (rumps ignores SIGTERM). Only our own child —
+        # the widget also self-exits when its parent dies (see _watch_parent), so
+        # a global pkill would just risk killing another instance's widget.
         if menubar_proc is not None:
             try:
                 menubar_proc.kill()
                 menubar_proc.wait(timeout=2)
             except OSError:
                 pass
-        # Fallback: kill any widget this launcher lost track of
-        subprocess.run(
-            ["pkill", "-9", "-x", "TimexMenubar"],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-        )
 
     atexit.register(_cleanup)
 
@@ -151,7 +184,7 @@ def main() -> None:
 
     window = webview.create_window(
         title="Timex",
-        url=f"http://{HOST}:{PORT}/?fontsize=12",
+        url=f"http://{HOST}:{PORT}/?fontsize=12" + (f"&token={token}" if token else ""),
         width=400,
         height=732,
         background_color=BG,
